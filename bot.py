@@ -3,8 +3,9 @@
 Hebrew Learning Telegram Bot for Russian Speakers
 Бот для изучения иврита русскоговорящими
 
-
-
+Переменные окружения (задаются в панели BotHost или в файле .env локально):
+  TELEGRAM_TOKEN      — токен бота от @BotFather
+  ANTHROPIC_API_KEY   — ключ API от console.anthropic.com
 """
 
 import asyncio
@@ -33,26 +34,41 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─── .env loader (только для локальной разработки) ────────────────────────────
-# На BotHost переменные задаются через панель — этот блок просто игнорируется
 _env_file = Path(__file__).parent / ".env"
 if _env_file.exists():
+    logger.info(".env файл найден, загружаем...")
     with open(_env_file) as _f:
         for _line in _f:
             _line = _line.strip()
             if _line and not _line.startswith("#") and "=" in _line:
                 _key, _, _val = _line.partition("=")
                 os.environ.setdefault(_key.strip(), _val.strip())
+else:
+    logger.info(".env файл не найден — используем переменные окружения системы")
 
 # ─── Config ───────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 DATA_FILE = Path("user_data.json")
 
-# Проверка при старте — сразу видно если токены не заданы
+# Диагностика: показываем какие переменные видит процесс при старте
+_all_keys = list(os.environ.keys())
+logger.info(f"Все доступные переменные окружения: {_all_keys}")
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
+
+logger.info(f"TELEGRAM_TOKEN найден: {'ДА' if TELEGRAM_TOKEN else 'НЕТ'}")
+logger.info(f"ANTHROPIC_API_KEY найден: {'ДА' if ANTHROPIC_API_KEY else 'НЕТ'}")
+
 if not TELEGRAM_TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN не задан! Добавьте его в переменные окружения BotHost.")
+    raise RuntimeError(
+        "TELEGRAM_TOKEN не найден в переменных окружения. "
+        f"Доступные переменные: {_all_keys}"
+    )
 if not ANTHROPIC_API_KEY:
-    raise RuntimeError("ANTHROPIC_API_KEY не задан! Добавьте его в переменные окружения BotHost.")
+    raise RuntimeError(
+        "ANTHROPIC_API_KEY не найден в переменных окружения. "
+        f"Доступные переменные: {_all_keys}"
+    )
 
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_MODEL = "claude-sonnet-4-6"
