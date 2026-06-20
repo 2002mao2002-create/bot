@@ -1,0 +1,22 @@
+# Секреты — никогда не загружать на GitHub!
+.env
+*.env
+
+# База данных пользователей (локальные данные)
+user_data.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Бэкапы
+*.bak
