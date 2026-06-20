@@ -9,6 +9,8 @@ import json
 import logging
 import os
 import random
+import urllib.request
+import urllib.error
 from datetime import datetime, time
 from pathlib import Path
 
@@ -19,7 +21,6 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ContextTypes, filters
 )
-import anthropic
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -33,7 +34,32 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_TOKEN")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "YOUR_ANTHROPIC_API_KEY")
 DATA_FILE = Path("user_data.json")
 
-anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_MODEL = "claude-sonnet-4-6"
+
+# ─── Anthropic API (pure stdlib, no sdk) ──────────────────────────────────────
+def call_claude(system: str, user_text: str, max_tokens: int = 600) -> str:
+    """Call Anthropic API using only stdlib urllib — no anthropic package needed."""
+    payload = json.dumps({
+        "model": ANTHROPIC_MODEL,
+        "max_tokens": max_tokens,
+        "system": system,
+        "messages": [{"role": "user", "content": user_text}],
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        ANTHROPIC_API_URL,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    return data["content"][0]["text"]
 
 # ─── Hebrew Lessons Database ───────────────────────────────────────────────────
 LESSONS = {
@@ -417,16 +443,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "⚙️ Настройки":
         await settings(update, context)
     elif context.user_data.get("ai_mode"):
-        # Forward to AI
+        # Forward to AI via direct HTTP call (no anthropic sdk)
         await update.message.chat.send_action("typing")
         try:
-            response = anthropic_client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=600,
-                system=AI_SYSTEM,
-                messages=[{"role": "user", "content": text}]
+            loop = asyncio.get_event_loop()
+            answer = await loop.run_in_executor(
+                None, lambda: call_claude(AI_SYSTEM, text)
             )
-            answer = response.content[0].text
             await update.message.reply_text(
                 f"🤖 {answer}\n\n_Задайте ещё вопрос или выберите раздел ниже:_",
                 parse_mode="Markdown",
