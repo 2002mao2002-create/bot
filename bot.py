@@ -3,9 +3,8 @@
 Hebrew Learning Telegram Bot for Russian Speakers
 Бот для изучения иврита русскоговорящими
 
-Переменные окружения (задаются в панели BotHost или в файле .env локально):
-  TELEGRAM_TOKEN      — токен бота от @BotFather
-  ANTHROPIC_API_KEY   — ключ API от console.anthropic.com
+
+
 """
 
 import asyncio
