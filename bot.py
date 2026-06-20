@@ -2,6 +2,10 @@
 """
 Hebrew Learning Telegram Bot for Russian Speakers
 Бот для изучения иврита русскоговорящими
+
+Переменные окружения (задаются в панели BotHost или в файле .env локально):
+  TELEGRAM_TOKEN      — токен бота от @BotFather
+  ANTHROPIC_API_KEY   — ключ API от console.anthropic.com
 """
 
 import asyncio
@@ -29,10 +33,27 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ─── .env loader (только для локальной разработки) ────────────────────────────
+# На BotHost переменные задаются через панель — этот блок просто игнорируется
+_env_file = Path(__file__).parent / ".env"
+if _env_file.exists():
+    with open(_env_file) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _key, _, _val = _line.partition("=")
+                os.environ.setdefault(_key.strip(), _val.strip())
+
 # ─── Config ───────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_TOKEN")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "YOUR_ANTHROPIC_API_KEY")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 DATA_FILE = Path("user_data.json")
+
+# Проверка при старте — сразу видно если токены не заданы
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("TELEGRAM_TOKEN не задан! Добавьте его в переменные окружения BotHost.")
+if not ANTHROPIC_API_KEY:
+    raise RuntimeError("ANTHROPIC_API_KEY не задан! Добавьте его в переменные окружения BotHost.")
 
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_MODEL = "claude-sonnet-4-6"
@@ -187,7 +208,7 @@ def update_streak(user_id: int):
     last = user.get("last_active")
     streak = user.get("streak", 0)
     if last != today:
-        from datetime import date, timedelta
+        from datetime import timedelta
         yesterday = (datetime.now().date() - timedelta(days=1)).isoformat()
         if last == yesterday:
             streak += 1
@@ -298,7 +319,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("learned_"):
         _, lesson_key, idx = data.split("_", 2)
-        phrase = LESSONS[lesson_key]["phrases"][int(idx)]
         key = f"{lesson_key}_{idx}"
         user = get_user(user_id)
         learned = user.get("learned", [])
@@ -324,7 +344,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("📚 Выберите тему:", reply_markup=lessons_keyboard())
 
     elif data.startswith("quiz_"):
-        await handle_quiz_answer(query, user_id, data)
+        await handle_quiz_answer(query, user_id, data, context)
 
 async def progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -393,19 +413,60 @@ async def send_quiz_question(message, user_id: int, context):
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
-async def handle_quiz_answer(query, user_id: int, data: str):
+async def handle_quiz_answer(query, user_id: int, data: str, context):
     chosen = int(data.split("_")[1])
-    correct_pos = query.message.reply_markup and None  # re-fetch from context
-    # We store in bot_data by user
-    from telegram.ext import ContextTypes
-    # Get from user_data via update
-    # We'll use a simple approach: store in the message itself
-    # Actually context is not accessible here, so we use a workaround
-    # Just give feedback based on stored data
-    pass
+    correct_pos = context.user_data.get("quiz_correct")
+    correct_phrase = context.user_data.get("quiz_phrase", {})
+
+    if correct_pos is None:
+        await query.edit_message_text("Начните тест заново — нажмите 🎯 Тест")
+        return
+
+    user = get_user(user_id)
+    quiz_total = user.get("quiz_total", 0) + 1
+    quiz_score = user.get("quiz_score", 0)
+
+    if chosen == correct_pos:
+        quiz_score += 1
+        result = "✅ *Правильно!*\n\n"
+    else:
+        result = "❌ *Неправильно.*\n\n"
+
+    result += (
+        f"🇮🇱 {correct_phrase.get('he', '')}\n"
+        f"🔤 {correct_phrase.get('translit', '')}\n"
+        f"🇷🇺 {correct_phrase.get('ru', '')}"
+    )
+
+    update_user(user_id, {"quiz_score": quiz_score, "quiz_total": quiz_total})
+    context.user_data.pop("quiz_correct", None)
+    context.user_data.pop("quiz_phrase", None)
+
+    buttons = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎯 Ещё вопрос", callback_data="next_quiz")],
+        [InlineKeyboardButton("📊 Мой счёт", callback_data="show_score")],
+    ])
+    await query.edit_message_text(result, parse_mode="Markdown", reply_markup=buttons)
+
+async def next_quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "next_quiz":
+        await send_quiz_question(query.message, query.from_user.id, context)
+    elif query.data == "show_score":
+        user = get_user(query.from_user.id)
+        score = user.get("quiz_score", 0)
+        total = user.get("quiz_total", 0)
+        pct = round(score / total * 100) if total else 0
+        await query.edit_message_text(
+            f"📊 *Ваш счёт в тестах*\n\n"
+            f"✅ Правильных: {score}/{total} ({pct}%)\n\n"
+            f"{'🏆 Отличный результат!' if pct >= 80 else '💪 Продолжайте практиковаться!'}",
+            parse_mode="Markdown"
+        )
 
 # ─── AI Assistant ──────────────────────────────────────────────────────────────
-AI_SYSTEM = """Ты — дружелюбный учитель иврита для русскоговорящих студентов. 
+AI_SYSTEM = """Ты — дружелюбный учитель иврита для русскоговорящих студентов.
 Ты помогаешь изучать иврит — объясняешь слова, грамматику, произношение.
 Всегда давай транслитерацию ивритских слов русскими буквами.
 Отвечай на русском языке. Будь позитивным и поддерживающим.
@@ -429,7 +490,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     update_streak(user_id)
 
-    # Main menu routing
     if text == "📚 Уроки":
         await lessons_menu(update, context)
     elif text == "🎯 Тест":
@@ -443,7 +503,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "⚙️ Настройки":
         await settings(update, context)
     elif context.user_data.get("ai_mode"):
-        # Forward to AI via direct HTTP call (no anthropic sdk)
         await update.message.chat.send_action("typing")
         try:
             loop = asyncio.get_event_loop()
@@ -505,64 +564,6 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         })
         await query.edit_message_text("🗑 Прогресс сброшен. Начинаем сначала!")
 
-# ─── Quiz with context ────────────────────────────────────────────────────────
-async def quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    user_id = query.from_user.id
-
-    chosen = int(data.split("_")[1])
-    correct_pos = context.user_data.get("quiz_correct")
-    correct_phrase = context.user_data.get("quiz_phrase", {})
-
-    if correct_pos is None:
-        await query.edit_message_text("Начните тест заново — /quiz")
-        return
-
-    user = get_user(user_id)
-    quiz_total = user.get("quiz_total", 0) + 1
-    quiz_score = user.get("quiz_score", 0)
-
-    if chosen == correct_pos:
-        quiz_score += 1
-        result = f"✅ *Правильно!*\n\n"
-    else:
-        result = f"❌ *Неправильно.*\n\n"
-
-    result += (
-        f"🇮🇱 {correct_phrase.get('he', '')}\n"
-        f"🔤 {correct_phrase.get('translit', '')}\n"
-        f"🇷🇺 {correct_phrase.get('ru', '')}"
-    )
-
-    update_user(user_id, {"quiz_score": quiz_score, "quiz_total": quiz_total})
-    context.user_data.pop("quiz_correct", None)
-    context.user_data.pop("quiz_phrase", None)
-
-    buttons = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎯 Ещё вопрос", callback_data="next_quiz")],
-        [InlineKeyboardButton("📊 Мой счёт", callback_data="show_score")],
-    ])
-    await query.edit_message_text(result, parse_mode="Markdown", reply_markup=buttons)
-
-async def next_quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data == "next_quiz":
-        await send_quiz_question(query.message, query.from_user.id, context)
-    elif query.data == "show_score":
-        user = get_user(query.from_user.id)
-        score = user.get("quiz_score", 0)
-        total = user.get("quiz_total", 0)
-        pct = round(score / total * 100) if total else 0
-        await query.edit_message_text(
-            f"📊 *Ваш счёт в тестах*\n\n"
-            f"✅ Правильных: {score}/{total} ({pct}%)\n\n"
-            f"{'🏆 Отличный результат!' if pct >= 80 else '💪 Продолжайте практиковаться!'}",
-            parse_mode="Markdown"
-        )
-
 # ─── Daily Reminder ───────────────────────────────────────────────────────────
 async def send_daily_reminders(context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
@@ -587,25 +588,20 @@ async def send_daily_reminders(context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("quiz", quiz))
     app.add_handler(CommandHandler("progress", progress))
 
-    # Callback handlers (order matters!)
-    app.add_handler(CallbackQueryHandler(quiz_callback, pattern=r"^quiz_\d+$"))
     app.add_handler(CallbackQueryHandler(next_quiz_callback, pattern=r"^(next_quiz|show_score)$"))
     app.add_handler(CallbackQueryHandler(settings_callback, pattern=r"^(toggle_reminders|reset_progress)$"))
     app.add_handler(CallbackQueryHandler(callback_handler))
 
-    # Messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Daily job at 09:00
     job_queue = app.job_queue
     job_queue.run_daily(send_daily_reminders, time=time(hour=9, minute=0))
 
-    logger.info("Bot started! 🚀")
+    logger.info("Bot started!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
