@@ -338,9 +338,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         phrase = LESSONS[lesson_key]["phrases"][int(idx)]
         translit = phrase["translit"]
         he = phrase["he"]
-        await query.answer(
-            f"🔊 {he}\nПроизносится: {translit}",
-            show_alert=True
+        ru = phrase["ru"]
+        await query.answer()  # убираем "часики" с кнопки
+        await query.message.reply_text(
+            f"🔊 *Произношение*\n\n"
+            f"🇮🇱 {he}\n"
+            f"👄 *Читается:* {translit}\n"
+            f"🇷🇺 {ru}\n\n"
+            f"_Повторите вслух несколько раз!_",
+            parse_mode="Markdown"
         )
 
     elif data.startswith("learned_"):
