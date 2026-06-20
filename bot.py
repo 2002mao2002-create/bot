@@ -15,6 +15,7 @@ import os
 import random
 import urllib.request
 import urllib.error
+import threading
 from datetime import datetime, time
 from pathlib import Path
 
@@ -590,24 +591,46 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("🗑 Прогресс сброшен. Начинаем сначала!")
 
 # ─── Daily Reminder ───────────────────────────────────────────────────────────
-async def send_daily_reminders(context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    tip = random.choice(DAILY_TIPS)
-    for uid, user in data.items():
-        if user.get("reminders", True):
+def _reminder_loop(bot_token: str):
+    """Фоновый поток: каждый день в 09:00 шлёт напоминания через urllib."""
+    import time as _time
+    while True:
+        now = datetime.now()
+        # Следующий запуск в 09:00
+        next_run = now.replace(hour=9, minute=0, second=0, microsecond=0)
+        if next_run <= now:
+            from datetime import timedelta
+            next_run += timedelta(days=1)
+        sleep_sec = (next_run - now).total_seconds()
+        logger.info(f"Следующее напоминание через {sleep_sec/3600:.1f} ч")
+        _time.sleep(sleep_sec)
+
+        data = load_data()
+        tip = random.choice(DAILY_TIPS)
+        for uid, user in data.items():
+            if not user.get("reminders", True):
+                continue
+            text = (
+                f"🌅 *Доброе утро! Время учить иврит!*\n\n"
+                f"{tip}\n\n"
+                f"Ваша серия: 🔥 {user.get('streak', 0)} дней\n\n"
+                f"Выберите урок и выучите 3-5 новых фраз! 💪"
+            )
+            payload = json.dumps({
+                "chat_id": int(uid),
+                "text": text,
+                "parse_mode": "Markdown",
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
             try:
-                await context.bot.send_message(
-                    chat_id=int(uid),
-                    text=(
-                        f"🌅 *Доброе утро! Время учить иврит!*\n\n"
-                        f"{tip}\n\n"
-                        f"Ваша серия: 🔥 {user.get('streak', 0)} дней\n\n"
-                        f"Выберите урок и выучите 3-5 новых фраз! 💪"
-                    ),
-                    parse_mode="Markdown"
-                )
+                urllib.request.urlopen(req, timeout=10)
             except Exception as e:
-                logger.warning(f"Couldn't send reminder to {uid}: {e}")
+                logger.warning(f"Напоминание для {uid} не отправлено: {e}")
 
 # ─── Main ──────────────────────────────────────────────────────────────────────
 def main():
@@ -623,8 +646,9 @@ def main():
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    job_queue = app.job_queue
-    job_queue.run_daily(send_daily_reminders, time=time(hour=9, minute=0))
+    # Запускаем напоминания в фоновом потоке (без job-queue)
+    t = threading.Thread(target=_reminder_loop, args=(TELEGRAM_TOKEN,), daemon=True)
+    t.start()
 
     logger.info("Bot started!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
