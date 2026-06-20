@@ -53,7 +53,17 @@ DATA_FILE = Path("user_data.json")
 _all_keys = list(os.environ.keys())
 logger.info(f"Все доступные переменные окружения: {_all_keys}")
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+# BotHost автоматически задаёт токен бота в переменной BOT_TOKEN.
+# Также проверяем альтернативные названия на случай других хостингов.
+TELEGRAM_TOKEN = (
+    os.getenv("BOT_TOKEN") or
+    os.getenv("TELEGRAM_BOT_TOKEN") or
+    os.getenv("TELEGRAM_TOKEN") or
+    os.getenv("TOKEN") or
+    os.getenv("BOT_API_TOKEN") or
+    ""
+).strip()
+
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 
 logger.info(f"TELEGRAM_TOKEN найден: {'ДА' if TELEGRAM_TOKEN else 'НЕТ'}")
@@ -61,7 +71,7 @@ logger.info(f"ANTHROPIC_API_KEY найден: {'ДА' if ANTHROPIC_API_KEY else 
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError(
-        "TELEGRAM_TOKEN не найден в переменных окружения. "
+        "Токен бота не найден. Ожидались переменные: BOT_TOKEN, TELEGRAM_TOKEN, TOKEN. "
         f"Доступные переменные: {_all_keys}"
     )
 if not ANTHROPIC_API_KEY:
