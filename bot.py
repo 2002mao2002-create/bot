@@ -6,7 +6,6 @@ Hebrew Learning Telegram Bot for Russian Speakers
 Переменные окружения (задаются в панели BotHost или в файле .env):
   TELEGRAM_TOKEN      — токен бота
   ANTHROPIC_API_KEY   — ключ API Anthropic
-  GROQ_API_KEY        — ключ API Groq (для Whisper STT)
 """
 
 import asyncio
@@ -21,6 +20,7 @@ import urllib.parse
 import urllib.error
 import io
 import threading
+import requests as _requests
 from datetime import datetime, time, timedelta
 from pathlib import Path
 
@@ -88,7 +88,8 @@ if not ANTHROPIC_API_KEY:
     raise RuntimeError("ANTHROPIC_API_KEY не найден в переменных окружения.")
 
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
-ANTHROPIC_MODEL = "claude-3-5-sonnet-latest"
+# Примечание: Убедитесь, что используете поддерживаемое имя модели, например "claude-3-5-sonnet-20241022"
+ANTHROPIC_MODEL = "claude-3-5-sonnet-20241022" 
 
 # ─── Anthropic API ────────────────────────────────────────────────────────────
 def call_claude(system: str, user_text: str, max_tokens: int = 600) -> str:
@@ -123,7 +124,7 @@ def get_hebrew_tts(text: str) -> bytes:
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         }
     )
     with urllib.request.urlopen(req, timeout=10) as resp:
@@ -152,7 +153,7 @@ def evaluate_pronunciation(transcribed: str, correct_he: str, correct_translit: 
     system = """Ты — преподаватель иврита. Твоя задача — оценить произношение студента.
 Тебе дадут: что студент произнёс (транскрипция Whisper на иврите), и правильное слово/фразу.
 Оцени точность произношения по шкале от 1 до 5 звёзд.
-Дай краткий, добрый и班структивный фидбек на русском языке.
+Дай краткий, добрый и конструктивный фидбек на русском языке.
 Ответь строго в формате:
 ОЦЕНКА: ⭐⭐⭐ (от 1 до 5 звёзд)
 ФИДБЕК: (1-2 предложения)
@@ -166,17 +167,11 @@ def evaluate_pronunciation(transcribed: str, correct_he: str, correct_translit: 
     )
     return call_claude(system, user_text, max_tokens=300)
 
+# ─── База данных уроков ───────────────────────────────────────────────────────
 LESSONS = {
     "greetings": {
         "title": "👋 Приветствия",
         "phrases": [
             {"he": "שָׁלוֹם", "translit": "Шалом", "ru": "Привет / Мир"},
             {"he": "בֹּקֶר טוֹב", "translit": "Бокер тов", "ru": "Доброе утро"},
-            {"he": "עֶרֶב טוֹב", "translit": "Эрев тов", "ru": "Добрый вечер"},
-            {"he": "לַיְלָה טוֹב", "translit": "Лайла тов", "ru": "Спокойной ночи"},
-            {"he": "מַה שְׁלוֹמְךָ?", "translit": "Ма шломха? (м) / Ма шломех? (ж)", "ru": "Как дела?"},
-            {"he": "בְּסֵדֶר", "translit": "Бесэдэр", "ru": "Хорошо / Нормально"},
-            {"he": "תּוֹדָה", "translit": "Тода", "ru": "Спасибо"},
-            {"he": "בְּבַקָּשָׁה", "translit": "Бевакаша", "ru": "Пожалуйста"},
-            {"he": "סְלִיחָה", "translit": "Слиха", "ru": "Извините / Простите"},
-            {"he": "לְהִתְרָאוֹת", "translit": "Лехитра
+            {"he": "עֶרֶב טוֹב
