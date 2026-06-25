@@ -62,6 +62,7 @@ TELEGRAM_TOKEN = (
 ).strip()
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
 logger.info(f"TELEGRAM_TOKEN найден: {'ДА' if TELEGRAM_TOKEN else 'НЕТ'}")
 logger.info(f"ANTHROPIC_API_KEY найден: {'ДА' if ANTHROPIC_API_KEY else 'НЕТ'}")
@@ -115,7 +116,57 @@ def get_hebrew_tts(text: str) -> bytes:
     with urllib.request.urlopen(req, timeout=10) as resp:
         return resp.read()
 
-# ─── Hebrew Lessons Database ──────────────────────────────────────────────────
+# ─── Whisper STT для проверки произношения ────────────────────────────────────
+def transcribe_audio_whisper(audio_bytes: bytes, filename: str = "voice.ogg") -> str:
+    """Транскрибирует аудио через OpenAI Whisper API"""
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY не задан")
+
+    boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW"
+    body = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="model"\r\n\r\n'
+        f"whisper-1\r\n"
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="language"\r\n\r\n'
+        f"he\r\n"
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+        f"Content-Type: audio/ogg\r\n\r\n"
+    ).encode("utf-8") + audio_bytes + f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/audio/transcriptions",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        result = json.loads(resp.read().decode("utf-8"))
+    return result.get("text", "").strip()
+
+
+def evaluate_pronunciation(transcribed: str, correct_he: str, correct_translit: str, correct_ru: str) -> str:
+    """Оценивает произношение через Claude"""
+    system = """Ты — преподаватель иврита. Твоя задача — оценить произношение студента.
+Тебе дадут: что студент произнёс (транскрипция Whisper на иврите), и правильное слово/фразу.
+Оцени точность произношения по шкале от 1 до 5 звёзд.
+Дай краткий, добрый и конструктивный фидбек на русском языке.
+Ответь строго в формате:
+ОЦЕНКА: ⭐⭐⭐ (от 1 до 5 звёзд)
+ФИДБЕК: (1-2 предложения)
+СОВЕТ: (короткий совет по улучшению, если нужно)"""
+
+    user_text = (
+        f"Студент произнёс (распознано Whisper): «{transcribed}»\n"
+        f"Правильное слово на иврите: {correct_he}\n"
+        f"Правильная транслитерация: {correct_translit}\n"
+        f"Перевод: {correct_ru}"
+    )
+    return call_claude(system, user_text, max_tokens=300)
 LESSONS = {
     "greetings": {
         "title": "👋 Приветствия",
@@ -145,19 +196,6 @@ LESSONS = {
             {"he": "שְׁמוֹנֶה", "translit": "Шмоне", "ru": "Восемь (8)"},
             {"he": "תֵּשַׁע", "translit": "Теша", "ru": "Девять (9)"},
             {"he": "עֶשֶׂר", "translit": "Эсэр", "ru": "Десять (10)"},
-        ]
-    },
-    "family": {
-        "title": "👨‍👩‍👧 Семья",
-        "phrases": [
-            {"he": "אָבָא", "translit": "Аба", "ru": "Папа"},
-            {"he": "אִמָּא", "translit": "Има", "ru": "Мама"},
-            {"he": "אָח", "translit": "Ах", "ru": "Брат"},
-            {"he": "אָחוֹת", "translit": "Ахот", "ru": "Сестра"},
-            {"he": "בֵּן", "translit": "Бен", "ru": "Сын"},
-            {"he": "בַּת", "translit": "Бат", "ru": "Дочь"},
-            {"he": "סָבָא", "translit": "Саба", "ru": "Дедушка"},
-            {"he": "סָבְתָא", "translit": "Савта", "ru": "Бабушка"},
         ]
     },
     "food": {
@@ -347,7 +385,7 @@ def main_menu_keyboard():
     return ReplyKeyboardMarkup([
         ["📚 Уроки", "🎯 Тест"],
         ["📊 Мой прогресс", "💡 Совет дня"],
-        ["🤖 Спросить ИИ", "⚙️ Настройки"],
+        ["⚙️ Настройки"],
     ], resize_keyboard=True)
 
 def lessons_keyboard():
@@ -367,13 +405,17 @@ def phrase_keyboard(lesson_key: str, phrase_idx: int, total: int):
         InlineKeyboardButton("🔊 Произношение", callback_data=f"audio_{lesson_key}_{phrase_idx}"),
         InlineKeyboardButton("✅ Выучил!", callback_data=f"learned_{lesson_key}_{phrase_idx}"),
     ]
-    row3 = [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]
+    row3 = [
+        InlineKeyboardButton("🎤 Проверить произношение", callback_data=f"checkpron_{lesson_key}_{phrase_idx}"),
+    ]
+    row4 = [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]
 
     rows = []
     if row1:
         rows.append(row1)
     rows.append(row2)
     rows.append(row3)
+    rows.append(row4)
     return InlineKeyboardMarkup(rows)
 
 # ─── Handlers ─────────────────────────────────────────────────────────────────
@@ -469,6 +511,33 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("✅ Отлично! Фраза добавлена в выученные!", show_alert=False)
         else:
             await query.answer("Вы уже выучили эту фразу! 🌟", show_alert=False)
+
+    elif data.startswith("checkpron_"):
+        _, lesson_key, idx = data.split("_", 2)
+        phrase = LESSONS[lesson_key]["phrases"][int(idx)]
+        context.user_data["pron_check"] = {
+            "lesson_key": lesson_key,
+            "phrase_idx": int(idx),
+            "he": phrase["he"],
+            "translit": phrase["translit"],
+            "ru": phrase["ru"],
+        }
+        if not OPENAI_API_KEY:
+            await query.message.reply_text(
+                "⚠️ Для проверки произношения нужен *OPENAI\\_API\\_KEY*\\.\n"
+                "Добавьте его в переменные окружения\\.",
+                parse_mode="MarkdownV2"
+            )
+            return
+        await query.message.reply_text(
+            f"🎤 *Проверка произношения*\n\n"
+            f"Произнесите это слово/фразу голосовым сообщением:\n\n"
+            f"🇮🇱 *{phrase['he']}*\n"
+            f"🔤 _{phrase['translit']}_\n"
+            f"🇷🇺 {phrase['ru']}\n\n"
+            f"_Запишите голосовое сообщение и отправьте его сюда_ 👇",
+            parse_mode="Markdown"
+        )
 
     elif data == "main_menu":
         await query.edit_message_text(
@@ -604,25 +673,72 @@ async def next_quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             parse_mode="Markdown"
         )
 
-# ─── AI Assistant ──────────────────────────────────────────────────────────────
-AI_SYSTEM = """Ты — дружелюбный учитель иврита для русскоговорящих студентов.
-Ты помогаешь изучать иврит — объясняешь слова, грамматику, произношение.
-Всегда давай транслитерацию ивритских слов русскими буквами.
-Отвечай на русском языке. Будь позитивным и поддерживающим.
-Когда пишешь ивритские слова, всегда добавляй транслитерацию в скобках.
-Примеры: שָׁלוֹם (шалом), תּוֹדָה (тода), כֵּן (кен)."""
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает голосовые сообщения для проверки произношения"""
+    user_id = update.effective_user.id
+    pron_data = context.user_data.get("pron_check")
 
-async def ai_assistant(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 *ИИ-помощник по ивриту*\n\n"
-        "Задайте любой вопрос об иврите!\n"
-        "Например:\n"
-        "• «Как сказать 'я тебя люблю'?»\n"
-        "• «Расскажи про ивритский алфавит»\n"
-        "• «Как считать до 100?»",
-        parse_mode="Markdown"
-    )
-    context.user_data["ai_mode"] = True
+    if not pron_data:
+        await update.message.reply_text(
+            "Чтобы проверить произношение, сначала выберите слово в уроке и нажмите *🎤 Проверить произношение*.",
+            parse_mode="Markdown"
+        )
+        return
+
+    await update.message.chat.send_action("typing")
+    await update.message.reply_text("⏳ Анализирую произношение...")
+
+    try:
+        # Скачиваем голосовое сообщение
+        voice = update.message.voice
+        file = await context.bot.get_file(voice.file_id)
+        audio_bytes = await file.download_as_bytearray()
+
+        loop = asyncio.get_event_loop()
+
+        # Транскрибируем через Whisper
+        transcribed = await loop.run_in_executor(
+            None, lambda: transcribe_audio_whisper(bytes(audio_bytes))
+        )
+
+        if not transcribed:
+            await update.message.reply_text(
+                "😕 Не удалось распознать речь. Попробуйте говорить чётче и ближе к микрофону."
+            )
+            return
+
+        # Оцениваем через Claude
+        feedback = await loop.run_in_executor(
+            None, lambda: evaluate_pronunciation(
+                transcribed,
+                pron_data["he"],
+                pron_data["translit"],
+                pron_data["ru"],
+            )
+        )
+
+        result_text = (
+            f"🎤 *Результат проверки произношения*\n\n"
+            f"🇮🇱 Слово: *{pron_data['he']}*\n"
+            f"🔤 Правильно: _{pron_data['translit']}_\n"
+            f"🗣 Распознано: _{transcribed}_\n\n"
+            f"{feedback}"
+        )
+
+        buttons = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Попробовать ещё раз", callback_data=f"checkpron_{pron_data['lesson_key']}_{pron_data['phrase_idx']}")],
+            [InlineKeyboardButton("▶️ Продолжить урок", callback_data=f"phrase_{pron_data['lesson_key']}_{pron_data['phrase_idx']}")],
+        ])
+
+        await update.message.reply_text(result_text, parse_mode="Markdown", reply_markup=buttons)
+        context.user_data.pop("pron_check", None)
+
+    except Exception as e:
+        logger.error(f"Voice check error: {e}")
+        await update.message.reply_text(
+            "❌ Ошибка при анализе. Проверьте, что OPENAI_API_KEY задан верно, и попробуйте снова.",
+            reply_markup=main_menu_keyboard()
+        )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -637,29 +753,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await progress(update, context)
     elif text == "💡 Совет дня":
         await daily_tip(update, context)
-    elif text == "🤖 Спросить ИИ":
-        await ai_assistant(update, context)
     elif text == "⚙️ Настройки":
         await settings(update, context)
-    elif context.user_data.get("ai_mode"):
-        await update.message.chat.send_action("typing")
-        try:
-            loop = asyncio.get_event_loop()
-            answer = await loop.run_in_executor(
-                None, lambda: call_claude(AI_SYSTEM, text)
-            )
-            await update.message.reply_text(
-                f"🤖 {answer}\n\n_Задайте ещё вопрос или выберите раздел ниже:_",
-                parse_mode="Markdown",
-                reply_markup=main_menu_keyboard()
-            )
-        except Exception as e:
-            logger.error(f"AI error: {e}")
-            await update.message.reply_text(
-                "Извините, не могу ответить прямо сейчас. Попробуйте позже.",
-                reply_markup=main_menu_keyboard()
-            )
-        context.user_data["ai_mode"] = False
     else:
         await update.message.reply_text(
             "Выберите раздел в меню ниже 👇",
@@ -756,6 +851,7 @@ def main():
     app.add_handler(CallbackQueryHandler(callback_handler))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
     # Запускаем напоминания в фоновом потоке
     t = threading.Thread(target=_reminder_loop, args=(TELEGRAM_TOKEN,), daemon=True)
