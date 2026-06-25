@@ -18,6 +18,7 @@ import urllib.parse
 import io
 import threading
 import tempfile
+import subprocess
 from datetime import datetime, time, timedelta
 from pathlib import Path
 
@@ -55,7 +56,6 @@ else:
 # ─── Config ───────────────────────────────────────────────────────────────────
 DATA_FILE = Path("user_data.json")
 
-# BotHost автоматически задаёт токен бота в переменной BOT_TOKEN.
 TELEGRAM_TOKEN = (
     os.getenv("BOT_TOKEN") or
     os.getenv("TELEGRAM_BOT_TOKEN") or
@@ -122,19 +122,22 @@ def get_hebrew_tts(text: str) -> bytes:
 # ─── Speech Recognition ──────────────────────────────────────────────────────
 def recognize_speech(audio_bytes: bytes) -> str:
     """Распознаёт ивритскую речь из аудио (формат OGG)"""
+    temp_files = []
     try:
         # Сохраняем аудио во временный файл
         with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
             tmp.write(audio_bytes)
             tmp_path = tmp.name
+            temp_files.append(tmp_path)
         
-        # Конвертируем OGG в WAV (speech_recognition работает с WAV)
-        import subprocess
+        # Конвертируем OGG в WAV
         wav_path = tmp_path.replace(".ogg", ".wav")
+        temp_files.append(wav_path)
+        
         subprocess.run([
             "ffmpeg", "-i", tmp_path, "-ar", "16000", "-ac", "1", wav_path,
             "-y", "-loglevel", "quiet"
-        ], check=True)
+        ], check=True, capture_output=True)
         
         # Распознаём речь
         recognizer = sr.Recognizer()
@@ -147,25 +150,33 @@ def recognize_speech(audio_bytes: bytes) -> str:
             return text
         except sr.UnknownValueError:
             return None
-        except sr.RequestError:
+        except sr.RequestError as e:
+            logger.error(f"Google Speech Recognition error: {e}")
             return None
-        finally:
-            # Удаляем временные файлы
-            os.unlink(tmp_path)
-            if os.path.exists(wav_path):
-                os.unlink(wav_path)
             
+    except subprocess.CalledProcessError as e:
+        logger.error(f"FFmpeg error: {e}")
+        return None
     except Exception as e:
         logger.error(f"Speech recognition error: {e}")
         return None
+    finally:
+        # Удаляем временные файлы
+        for path in temp_files:
+            try:
+                if os.path.exists(path):
+                    os.unlink(path)
+            except:
+                pass
 
 def normalize_hebrew(text: str) -> str:
-    """Нормализует ивритский текст для сравнения (удаляет огласовки)"""
-    # Простое удаление огласовок (не идеально, но работает)
+    """Нормализует ивритский текст для сравнения"""
+    # Удаляем огласовки (никуд)
     import re
-    # Удаляем никуд (огласовки) — базовый подход
-    # В реальности нужно использовать более сложную нормализацию
-    text = re.sub(r'[\u0591-\u05C7]', '', text)  # Удаляем огласовки
+    text = re.sub(r'[\u0591-\u05C7]', '', text)
+    # Удаляем знаки препинания и лишние пробелы
+    text = re.sub(r'[^\u05D0-\u05EA\s]', '', text)
+    text = ' '.join(text.split())
     return text.strip()
 
 # ─── Hebrew Lessons Database ──────────────────────────────────────────────────
@@ -430,6 +441,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📊 *Прогресс* — следи за успехами\n"
         "💡 *Совет дня* — интересные факты\n"
         "🤖 *ИИ-помощник* — задай любой вопрос об иврите\n\n"
+        "🎤 *Новое!* Теперь можно проверять произношение!\n"
+        "Нажмите «Проверить» в уроке и отправьте голосовое сообщение.\n\n"
         "Иврит читается *справа налево* — начнём! 🇮🇱"
     )
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
@@ -503,7 +516,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         idx = int(idx)
         phrase = LESSONS[lesson_key]["phrases"][idx]
         
-        # Сохраняем информацию о том, что проверяем
+        # Сохраняем информацию о проверке
         context.user_data["check_lesson"] = lesson_key
         context.user_data["check_idx"] = idx
         context.user_data["check_word"] = phrase["he"]
@@ -627,19 +640,20 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lesson_key = context.user_data.get("check_lesson")
     idx = context.user_data.get("check_idx")
     
-    await update.message.reply_text("🎤 Распознаю речь... Подождите секунду...")
+    # Отправляем сообщение о начале обработки
+    msg = await update.message.reply_text("🎤 Распознаю речь... Подождите секунду...")
     
     try:
         # Скачиваем голосовое сообщение
         voice_file = await voice.get_file()
         audio_bytes = await voice_file.download_as_bytearray()
         
-        # Распознаём речь в отдельном потоке (т.к. это может занять время)
+        # Распознаём речь в отдельном потоке
         loop = asyncio.get_event_loop()
         recognized = await loop.run_in_executor(None, recognize_speech, bytes(audio_bytes))
         
         if recognized is None:
-            await update.message.reply_text(
+            await msg.edit_text(
                 "❌ Не удалось распознать речь.\n\n"
                 "Попробуйте:\n"
                 "• Говорить чётче и громче\n"
@@ -650,15 +664,17 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         
-        # Сравниваем с ожидаемым словом
+        # Нормализуем для сравнения
         expected_norm = normalize_hebrew(expected_word)
         recognized_norm = normalize_hebrew(recognized)
         
-        # Проверяем, содержит ли распознанный текст ожидаемое слово
-        # (учитывая, что могут быть лишние слова)
-        if expected_norm in recognized_norm or recognized_norm in expected_norm:
+        # Проверяем совпадение
+        # Ищем частичное совпадение (слово может быть частью фразы)
+        is_correct = expected_norm in recognized_norm or recognized_norm in expected_norm
+        
+        if is_correct:
             # Правильно!
-            await update.message.reply_text(
+            await msg.edit_text(
                 f"✅ *Отлично!* Вы правильно произнесли!\n\n"
                 f"🎯 Вы сказали: {recognized}\n"
                 f"📖 Ожидалось: {expected_word} ({translit})\n\n"
@@ -680,7 +696,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 update_user(user_id, {"learned": learned, "total_phrases": total_phrases})
         else:
             # Неправильно
-            await update.message.reply_text(
+            await msg.edit_text(
                 f"❌ *Не совсем правильно.*\n\n"
                 f"🎯 Вы сказали: {recognized}\n"
                 f"📖 Ожидалось: {expected_word} ({translit})\n\n"
@@ -695,7 +711,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
     except Exception as e:
         logger.error(f"Voice processing error: {e}")
-        await update.message.reply_text(
+        await msg.edit_text(
             "❌ Произошла ошибка при обработке голосового сообщения.\n\n"
             "Попробуйте ещё раз или используйте текстовый режим.",
             reply_markup=main_menu_keyboard()
@@ -967,7 +983,7 @@ def main():
     app.add_handler(CommandHandler("quiz", quiz))
     app.add_handler(CommandHandler("progress", progress))
 
-    # Обработчики голосовых сообщений
+    # Обработчик голосовых сообщений
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     
     app.add_handler(CallbackQueryHandler(next_quiz_callback, pattern=r"^(next_quiz|show_score)$"))
