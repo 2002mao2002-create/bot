@@ -62,7 +62,7 @@ TELEGRAM_TOKEN = (
 ).strip()
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 
 logger.info(f"TELEGRAM_TOKEN найден: {'ДА' if TELEGRAM_TOKEN else 'НЕТ'}")
 logger.info(f"ANTHROPIC_API_KEY найден: {'ДА' if ANTHROPIC_API_KEY else 'НЕТ'}")
@@ -116,30 +116,33 @@ def get_hebrew_tts(text: str) -> bytes:
     with urllib.request.urlopen(req, timeout=10) as resp:
         return resp.read()
 
-# ─── Whisper STT для проверки произношения ────────────────────────────────────
+# ─── Groq Whisper STT для проверки произношения (бесплатно) ──────────────────
 def transcribe_audio_whisper(audio_bytes: bytes, filename: str = "voice.ogg") -> str:
-    """Транскрибирует аудио через OpenAI Whisper API"""
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY не задан")
+    """Транскрибирует аудио через Groq Whisper API (бесплатно)"""
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY не задан")
 
     boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW"
     body = (
         f"--{boundary}\r\n"
         f'Content-Disposition: form-data; name="model"\r\n\r\n'
-        f"whisper-1\r\n"
+        f"whisper-large-v3\r\n"
         f"--{boundary}\r\n"
         f'Content-Disposition: form-data; name="language"\r\n\r\n'
         f"he\r\n"
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="response_format"\r\n\r\n'
+        f"json\r\n"
         f"--{boundary}\r\n"
         f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
         f"Content-Type: audio/ogg\r\n\r\n"
     ).encode("utf-8") + audio_bytes + f"\r\n--{boundary}--\r\n".encode("utf-8")
 
     req = urllib.request.Request(
-        "https://api.openai.com/v1/audio/transcriptions",
+        "https://api.groq.com/openai/v1/audio/transcriptions",
         data=body,
         headers={
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Authorization": f"Bearer {GROQ_API_KEY}",
             "Content-Type": f"multipart/form-data; boundary={boundary}",
         },
         method="POST",
@@ -522,10 +525,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "translit": phrase["translit"],
             "ru": phrase["ru"],
         }
-        if not OPENAI_API_KEY:
+        if not GROQ_API_KEY:
             await query.message.reply_text(
-                "⚠️ Для проверки произношения нужен *OPENAI\\_API\\_KEY*\\.\n"
-                "Добавьте его в переменные окружения\\.",
+                "⚠️ Для проверки произношения нужен *GROQ\\_API\\_KEY*\\.\n"
+                "Получите бесплатно на console\\.groq\\.com",
                 parse_mode="MarkdownV2"
             )
             return
@@ -736,7 +739,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Voice check error: {e}")
         await update.message.reply_text(
-            "❌ Ошибка при анализе. Проверьте, что OPENAI_API_KEY задан верно, и попробуйте снова.",
+            "❌ Ошибка при анализе. Проверьте, что GROQ_API_KEY задан верно, и попробуйте снова.",
             reply_markup=main_menu_keyboard()
         )
 
