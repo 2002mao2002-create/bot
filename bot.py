@@ -119,21 +119,53 @@ def get_hebrew_tts(text: str) -> bytes:
         return resp.read()
 
 # ─── Groq Whisper STT для проверки произношения (бесплатно) ──────────────────
-def transcribe_audio_whisper(audio_bytes: bytes, filename: str = "voice.oga") -> str:
+def transcribe_audio_whisper(audio_bytes: bytes) -> str:
     """Транскрибирует аудио через Groq Whisper API (бесплатно)"""
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY не задан")
 
-    resp = _requests.post(
-        "https://api.groq.com/openai/v1/audio/transcriptions",
-        headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-        files={"file": ("voice.mp3", audio_bytes, "audio/mpeg")},
-        data={"model": "whisper-large-v3-turbo", "language": "he", "response_format": "json"},
-        timeout=30,
+    import email.generator
+    import email.mime.multipart
+    import email.mime.application
+    import email.mime.text
+
+    # Строим multipart вручную через email
+    boundary = "Boundary" + os.urandom(8).hex()
+
+    parts = []
+    # model
+    parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\nwhisper-large-v3-turbo\r\n')
+    # language
+    parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="language"\r\n\r\nhe\r\n')
+    # response_format
+    parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="response_format"\r\n\r\njson\r\n')
+    # file header
+    file_header = (
+        f'--{boundary}\r\n'
+        f'Content-Disposition: form-data; name="file"; filename="voice.ogg"\r\n'
+        f'Content-Type: audio/ogg\r\n\r\n'
     )
-    if not resp.ok:
-        raise RuntimeError(f"Groq {resp.status_code}: {resp.text[:400]}")
-    return resp.json().get("text", "").strip()
+    ending = f'\r\n--{boundary}--\r\n'
+
+    body = "".join(parts).encode() + file_header.encode() + audio_bytes + ending.encode()
+
+    req = urllib.request.Request(
+        "https://api.groq.com/openai/v1/audio/transcriptions",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "User-Agent": "python-urllib/3",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read().decode())
+        return result.get("text", "").strip()
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Groq HTTP {e.code}: {error_body[:500]}")
 
 
 def evaluate_pronunciation(transcribed: str, correct_he: str, correct_translit: str, correct_ru: str) -> str:
