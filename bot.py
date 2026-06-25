@@ -15,8 +15,10 @@ import os
 import random
 import urllib.request
 import urllib.parse
+import urllib.error
 import io
 import threading
+import requests as _requests
 from datetime import datetime, time, timedelta
 from pathlib import Path
 
@@ -122,34 +124,15 @@ def transcribe_audio_whisper(audio_bytes: bytes, filename: str = "voice.ogg") ->
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY не задан")
 
-    boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW"
-    body = (
-        f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="model"\r\n\r\n'
-        f"whisper-large-v3\r\n"
-        f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="language"\r\n\r\n'
-        f"he\r\n"
-        f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="response_format"\r\n\r\n'
-        f"json\r\n"
-        f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
-        f"Content-Type: audio/ogg\r\n\r\n"
-    ).encode("utf-8") + audio_bytes + f"\r\n--{boundary}--\r\n".encode("utf-8")
-
-    req = urllib.request.Request(
+    resp = _requests.post(
         "https://api.groq.com/openai/v1/audio/transcriptions",
-        data=body,
-        headers={
-            "Authorization": f"Bearer {GROQ_API_KEY}",
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
-        },
-        method="POST",
+        headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+        files={"file": (filename, audio_bytes, "audio/ogg")},
+        data={"model": "whisper-large-v3", "language": "he", "response_format": "json"},
+        timeout=30,
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        result = json.loads(resp.read().decode("utf-8"))
-    return result.get("text", "").strip()
+    resp.raise_for_status()
+    return resp.json().get("text", "").strip()
 
 
 def evaluate_pronunciation(transcribed: str, correct_he: str, correct_translit: str, correct_ru: str) -> str:
@@ -736,18 +719,18 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(result_text, parse_mode="Markdown", reply_markup=buttons)
         context.user_data.pop("pron_check", None)
 
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        logger.error(f"Voice check HTTP {e.code}: {body}")
+    except _requests.exceptions.HTTPError as e:
+        body = e.response.text[:300] if e.response else str(e)
+        logger.error(f"Voice check HTTP {e.response.status_code}: {body}")
         await update.message.reply_text(
-            f"❌ Ошибка HTTP {e.code} от Groq:\n<code>{body[:300]}</code>",
+            f"❌ Ошибка HTTP {e.response.status_code} от Groq:\n<code>{body}</code>",
             parse_mode="HTML",
             reply_markup=main_menu_keyboard()
         )
-    except urllib.error.URLError as e:
-        logger.error(f"Voice check URL error: {e.reason}")
+    except _requests.exceptions.ConnectionError as e:
+        logger.error(f"Voice check connection error: {e}")
         await update.message.reply_text(
-            f"❌ Сетевая ошибка: {e.reason}",
+            "❌ Нет соединения с Groq. Проверьте интернет и попробуйте снова.",
             reply_markup=main_menu_keyboard()
         )
     except Exception as e:
