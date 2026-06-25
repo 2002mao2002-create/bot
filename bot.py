@@ -13,6 +13,8 @@ import json
 import logging
 import os
 import random
+import subprocess
+import sys
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -21,6 +23,15 @@ import threading
 import requests as _requests
 from datetime import datetime, time, timedelta
 from pathlib import Path
+
+# ─── Авто-установка зависимостей ─────────────────────────────────────────────
+def _ensure_package(package: str):
+    try:
+        __import__(package)
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package, "-q"])
+
+_ensure_package("groq")
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
