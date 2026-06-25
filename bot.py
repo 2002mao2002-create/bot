@@ -351,7 +351,6 @@ def phrase_keyboard(lesson_key: str, phrase_idx: int, total: int):
 
     row2 = [
         InlineKeyboardButton("🔊 Произношение", callback_data=f"audio_{lesson_key}_{phrase_idx}"),
-        InlineKeyboardButton("🎤 Проверить", callback_data=f"check_{lesson_key}_{phrase_idx}"),
         InlineKeyboardButton("✅ Выучил!", callback_data=f"learned_{lesson_key}_{phrase_idx}"),
     ]
     row3 = [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]
@@ -376,8 +375,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📊 *Прогресс* — следи за успехами\n"
         "💡 *Совет дня* — интересные факты\n"
         "🤖 *ИИ-помощник* — задай любой вопрос об иврите\n\n"
-        "🎤 *Проверка произношения!*\n"
-        "Нажмите «Проверить» в уроке и отправьте голосовое сообщение.\n\n"
         "Иврит читается *справа налево* — начнём! 🇮🇱"
     )
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
@@ -399,8 +396,7 @@ async def show_phrase(query, lesson_key: str, phrase_idx: int):
         f"🇮🇱 *Иврит:*\n"
         f"```\n{phrase['he']}\n```\n\n"
         f"🔤 *Транслитерация:*\n_{phrase['translit']}_\n\n"
-        f"🇷🇺 *По-русски:*\n{phrase['ru']}\n\n"
-        f"🎤 Нажмите «Проверить» и скажите фразу вслух!"
+        f"🇷🇺 *По-русски:*\n{phrase['ru']}"
     )
     await query.edit_message_text(
         text,
@@ -445,34 +441,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Повторите вслух несколько раз!",
                 parse_mode="Markdown"
             )
-
-    elif data.startswith("check_"):
-        _, lesson_key, idx = data.split("_", 2)
-        idx = int(idx)
-        phrase = LESSONS[lesson_key]["phrases"][idx]
-        
-        # Сохраняем информацию о проверке
-        context.user_data["check_lesson"] = lesson_key
-        context.user_data["check_idx"] = idx
-        context.user_data["check_word"] = phrase["he"]
-        context.user_data["check_translit"] = phrase["translit"]
-        context.user_data["check_ru"] = phrase["ru"]
-        
-        await query.edit_message_text(
-            f"🎤 *Проверка произношения*\n\n"
-            f"Скажите вслух:\n"
-            f"🇮🇱 {phrase['he']}\n"
-            f"🔤 {phrase['translit']}\n"
-            f"🇷🇺 {phrase['ru']}\n\n"
-            f"📤 *Отправьте голосовое сообщение* с произношением.\n"
-            f"Бот проверит, правильно ли вы произнесли фразу!\n\n"
-            f"_Можно отправлять несколько попыток_",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("↩️ Назад к фразе", callback_data=f"phrase_{lesson_key}_{idx}")],
-                [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")],
-            ])
-        )
 
     elif data.startswith("learned_"):
         _, lesson_key, idx = data.split("_", 2)
@@ -673,82 +641,6 @@ async def next_quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             parse_mode="Markdown"
         )
 
-# ─── Voice Message Handler (упрощённая проверка) ──────────────────────────────
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает голосовые сообщения для проверки произношения"""
-    user_id = update.effective_user.id
-    
-    # Проверяем, ждём ли мы проверку произношения
-    if "check_word" not in context.user_data:
-        await update.message.reply_text(
-            "🎤 Чтобы проверить произношение, нажмите кнопку «Проверить» в уроке!",
-            reply_markup=main_menu_keyboard()
-        )
-        return
-    
-    # Получаем информацию о проверке
-    expected_word = context.user_data.get("check_word")
-    translit = context.user_data.get("check_translit", "")
-    ru = context.user_data.get("check_ru", "")
-    lesson_key = context.user_data.get("check_lesson")
-    idx = context.user_data.get("check_idx")
-    
-    # Отправляем сообщение о начале обработки
-    await update.message.reply_text(
-        f"🎤 Проверяю произношение...\n\n"
-        f"Ожидается: *{expected_word}* ({translit})",
-        parse_mode="Markdown"
-    )
-    
-    try:
-        # Скачиваем голосовое сообщение
-        voice = update.message.voice
-        voice_file = await voice.get_file()
-        audio_bytes = await voice_file.download_as_bytearray()
-        
-        # Используем встроенное распознавание Telegram (если доступно)
-        # В противном случае просто засчитываем попытку
-        
-        # Проверяем длительность (если слишком коротко - просим повторить)
-        if voice.duration < 1:
-            await update.message.reply_text(
-                "⚠️ Слишком короткое сообщение. Пожалуйста, произнесите фразу чётко и отправьте снова.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🎤 Попробовать снова", callback_data=f"check_{lesson_key}_{idx}")],
-                ])
-            )
-            return
-        
-        # Успешная проверка (в упрощённом варианте)
-        await update.message.reply_text(
-            f"✅ *Отлично!* Произношение принято!\n\n"
-            f"📖 Фраза: {expected_word} ({translit})\n"
-            f"🇷🇺 Перевод: {ru}\n\n"
-            f"🌟 Продолжайте в том же духе!",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("↩️ Вернуться к уроку", callback_data=f"phrase_{lesson_key}_{idx}")],
-                [InlineKeyboardButton("✅ Выучил!", callback_data=f"learned_{lesson_key}_{idx}")],
-            ])
-        )
-        
-        # Добавляем фразу в выученные, если её там нет
-        user = get_user(user_id)
-        key = f"{lesson_key}_{idx}"
-        if key not in user.get("learned", []):
-            learned = user.get("learned", [])
-            learned.append(key)
-            total_phrases = user.get("total_phrases", 0) + 1
-            update_user(user_id, {"learned": learned, "total_phrases": total_phrases})
-        
-    except Exception as e:
-        logger.error(f"Voice processing error: {e}")
-        await update.message.reply_text(
-            "❌ Произошла ошибка при обработке голосового сообщения.\n\n"
-            "Попробуйте ещё раз или используйте кнопку ✅ Выучил!",
-            reply_markup=main_menu_keyboard()
-        )
-
 # ─── AI Assistant ──────────────────────────────────────────────────────────────
 AI_SYSTEM = """Ты — дружелюбный учитель иврита для русскоговорящих студентов.
 Ты помогаешь изучать иврит — объясняешь слова, грамматику, произношение.
@@ -896,9 +788,6 @@ def main():
     app.add_handler(CommandHandler("quiz", quiz))
     app.add_handler(CommandHandler("progress", progress))
 
-    # Обработчик голосовых сообщений
-    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
-    
     app.add_handler(CallbackQueryHandler(next_quiz_callback, pattern=r"^(next_quiz|show_score)$"))
     app.add_handler(CallbackQueryHandler(settings_callback, pattern=r"^(toggle_reminders|reset_progress)$"))
     app.add_handler(CallbackQueryHandler(callback_handler))
