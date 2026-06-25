@@ -736,10 +736,25 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(result_text, parse_mode="Markdown", reply_markup=buttons)
         context.user_data.pop("pron_check", None)
 
-    except Exception as e:
-        logger.error(f"Voice check error: {e}")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        logger.error(f"Voice check HTTP {e.code}: {body}")
         await update.message.reply_text(
-            "❌ Ошибка при анализе. Проверьте, что GROQ_API_KEY задан верно, и попробуйте снова.",
+            f"❌ Ошибка HTTP {e.code} от Groq:\n<code>{body[:300]}</code>",
+            parse_mode="HTML",
+            reply_markup=main_menu_keyboard()
+        )
+    except urllib.error.URLError as e:
+        logger.error(f"Voice check URL error: {e.reason}")
+        await update.message.reply_text(
+            f"❌ Сетевая ошибка: {e.reason}",
+            reply_markup=main_menu_keyboard()
+        )
+    except Exception as e:
+        logger.error(f"Voice check error: {type(e).__name__}: {e}")
+        await update.message.reply_text(
+            f"❌ Ошибка: <code>{type(e).__name__}: {e}</code>",
+            parse_mode="HTML",
             reply_markup=main_menu_keyboard()
         )
 
