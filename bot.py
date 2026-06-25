@@ -147,19 +147,6 @@ LESSONS = {
             {"he": "עֶשֶׂר", "translit": "Эсэр", "ru": "Десять (10)"},
         ]
     },
-    "family": {
-        "title": "👨‍👩‍👧 Семья",
-        "phrases": [
-            {"he": "אָבָא", "translit": "Аба", "ru": "Папа"},
-            {"he": "אִמָּא", "translit": "Има", "ru": "Мама"},
-            {"he": "אָח", "translit": "Ах", "ru": "Брат"},
-            {"he": "אָחוֹת", "translit": "Ахот", "ru": "Сестра"},
-            {"he": "בֵּן", "translit": "Бен", "ru": "Сын"},
-            {"he": "בַּת", "translit": "Бат", "ru": "Дочь"},
-            {"he": "סָבָא", "translit": "Саба", "ru": "Дедушка"},
-            {"he": "סָבְתָא", "translit": "Савта", "ru": "Бабушка"},
-        ]
-    },
     "food": {
         "title": "🔥 10 главных глаголов",
         "phrases": [
@@ -458,10 +445,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("learned_"):
         _, lesson_key, idx = data.split("_", 2)
+        idx = int(idx)
         key = f"{lesson_key}_{idx}"
         user = get_user(user_id)
         learned = user.get("learned", [])
         total_phrases = user.get("total_phrases", 0)
+        lesson = LESSONS[lesson_key]
+        total = len(lesson["phrases"])
+        
         if key not in learned:
             learned.append(key)
             total_phrases += 1
@@ -469,18 +460,66 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("✅ Отлично! Фраза добавлена в выученные!", show_alert=False)
         else:
             await query.answer("Вы уже выучили эту фразу! 🌟", show_alert=False)
+        
+        # Переход к следующей фразе
+        next_idx = idx + 1
+        if next_idx < total:
+            await show_phrase(query, lesson_key, next_idx)
+        else:
+            # Если это была последняя фраза в уроке
+            await query.edit_message_text(
+                f"🎉 Поздравляю! Вы завершили урок «{lesson['title']}»!\n\n"
+                f"📊 Всего выучено фраз: {len(learned)}\n"
+                f"🔥 Серия: {user.get('streak', 0)} дней\n\n"
+                f"Продолжайте в том же духе! 💪",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📚 Другой урок", callback_data="go_lessons")],
+                    [InlineKeyboardButton("🎯 Пройти тест", callback_data="go_quiz")],
+                    [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")],
+                ])
+            )
 
     elif data == "main_menu":
         await query.edit_message_text(
-            "Выберите раздел 👇",
+            "🏠 *Главное меню*\n\nВыберите раздел:",
+            parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📚 Уроки", callback_data="go_lessons")],
                 [InlineKeyboardButton("🎯 Тест", callback_data="go_quiz")],
+                [InlineKeyboardButton("📊 Прогресс", callback_data="go_progress")],
             ])
         )
 
     elif data == "go_lessons":
-        await query.edit_message_text("📚 Выберите тему:", reply_markup=lessons_keyboard())
+        await query.edit_message_text("📚 *Выберите тему урока:*", parse_mode="Markdown", reply_markup=lessons_keyboard())
+
+    elif data == "go_quiz":
+        await send_quiz_question(query.message, user_id, context)
+        await query.delete_message()
+
+    elif data == "go_progress":
+        user = get_user(user_id)
+        total_available = sum(len(l["phrases"]) for l in LESSONS.values())
+        learned = len(user.get("learned", []))
+        streak = user.get("streak", 0)
+        quiz_score = user.get("quiz_score", 0)
+        quiz_total = user.get("quiz_total", 0)
+        accuracy = round(quiz_score / quiz_total * 100) if quiz_total > 0 else 0
+
+        bar_len = 10
+        filled = round(learned / total_available * bar_len) if total_available > 0 else 0
+        bar = "🟩" * filled + "⬜" * (bar_len - filled)
+
+        text = (
+            f"📊 *Ваш прогресс*\n\n"
+            f"🔥 Серия дней: *{streak}* {'🏆' if streak >= 7 else ''}\n\n"
+            f"📚 Выучено фраз:\n"
+            f"{bar} {learned}/{total_available}\n\n"
+            f"🎯 Тесты: *{quiz_score}/{quiz_total}* правильных ({accuracy}%)\n\n"
+            f"{'🌟 Вы освоили все фразы! Попробуйте тест!' if learned == total_available else '👉 Продолжайте учиться!'}"
+        )
+        await query.edit_message_text(text, parse_mode="Markdown")
 
     elif data.startswith("quiz_"):
         await handle_quiz_answer(query, user_id, data, context)
