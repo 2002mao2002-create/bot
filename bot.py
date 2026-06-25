@@ -17,6 +17,7 @@ import urllib.request
 import urllib.parse
 import io
 import threading
+import tempfile
 from datetime import datetime, time, timedelta
 from pathlib import Path
 
@@ -27,6 +28,9 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ContextTypes, filters
 )
+
+# Для распознавания речи
+import speech_recognition as sr
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -114,6 +118,55 @@ def get_hebrew_tts(text: str) -> bytes:
     )
     with urllib.request.urlopen(req, timeout=10) as resp:
         return resp.read()
+
+# ─── Speech Recognition ──────────────────────────────────────────────────────
+def recognize_speech(audio_bytes: bytes) -> str:
+    """Распознаёт ивритскую речь из аудио (формат OGG)"""
+    try:
+        # Сохраняем аудио во временный файл
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+            tmp.write(audio_bytes)
+            tmp_path = tmp.name
+        
+        # Конвертируем OGG в WAV (speech_recognition работает с WAV)
+        import subprocess
+        wav_path = tmp_path.replace(".ogg", ".wav")
+        subprocess.run([
+            "ffmpeg", "-i", tmp_path, "-ar", "16000", "-ac", "1", wav_path,
+            "-y", "-loglevel", "quiet"
+        ], check=True)
+        
+        # Распознаём речь
+        recognizer = sr.Recognizer()
+        with sr.AudioFile(wav_path) as source:
+            audio = recognizer.record(source)
+        
+        # Пробуем распознать иврит
+        try:
+            text = recognizer.recognize_google(audio, language="he-IL")
+            return text
+        except sr.UnknownValueError:
+            return None
+        except sr.RequestError:
+            return None
+        finally:
+            # Удаляем временные файлы
+            os.unlink(tmp_path)
+            if os.path.exists(wav_path):
+                os.unlink(wav_path)
+            
+    except Exception as e:
+        logger.error(f"Speech recognition error: {e}")
+        return None
+
+def normalize_hebrew(text: str) -> str:
+    """Нормализует ивритский текст для сравнения (удаляет огласовки)"""
+    # Простое удаление огласовок (не идеально, но работает)
+    import re
+    # Удаляем никуд (огласовки) — базовый подход
+    # В реальности нужно использовать более сложную нормализацию
+    text = re.sub(r'[\u0591-\u05C7]', '', text)  # Удаляем огласовки
+    return text.strip()
 
 # ─── Hebrew Lessons Database ──────────────────────────────────────────────────
 LESSONS = {
@@ -352,6 +405,7 @@ def phrase_keyboard(lesson_key: str, phrase_idx: int, total: int):
 
     row2 = [
         InlineKeyboardButton("🔊 Произношение", callback_data=f"audio_{lesson_key}_{phrase_idx}"),
+        InlineKeyboardButton("🎤 Проверить", callback_data=f"check_{lesson_key}_{phrase_idx}"),
         InlineKeyboardButton("✅ Выучил!", callback_data=f"learned_{lesson_key}_{phrase_idx}"),
     ]
     row3 = [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]
@@ -397,7 +451,8 @@ async def show_phrase(query, lesson_key: str, phrase_idx: int):
         f"🇮🇱 *Иврит:*\n"
         f"```\n{phrase['he']}\n```\n\n"
         f"🔤 *Транслитерация:*\n_{phrase['translit']}_\n\n"
-        f"🇷🇺 *По-русски:*\n{phrase['ru']}"
+        f"🇷🇺 *По-русски:*\n{phrase['ru']}\n\n"
+        f"🎤 Нажмите «Проверить» и скажите фразу вслух!"
     )
     await query.edit_message_text(
         text,
@@ -443,6 +498,34 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
 
+    elif data.startswith("check_"):
+        _, lesson_key, idx = data.split("_", 2)
+        idx = int(idx)
+        phrase = LESSONS[lesson_key]["phrases"][idx]
+        
+        # Сохраняем информацию о том, что проверяем
+        context.user_data["check_lesson"] = lesson_key
+        context.user_data["check_idx"] = idx
+        context.user_data["check_word"] = phrase["he"]
+        context.user_data["check_translit"] = phrase["translit"]
+        context.user_data["check_ru"] = phrase["ru"]
+        
+        await query.edit_message_text(
+            f"🎤 *Проверка произношения*\n\n"
+            f"Скажите вслух:\n"
+            f"🇮🇱 {phrase['he']}\n"
+            f"🔤 {phrase['translit']}\n"
+            f"🇷🇺 {phrase['ru']}\n\n"
+            f"📤 *Отправьте голосовое сообщение* с произношением.\n"
+            f"Бот проверит, правильно ли вы произнесли фразу!\n\n"
+            f"_Можно отправлять несколько попыток_",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("↩️ Назад к фразе", callback_data=f"phrase_{lesson_key}_{idx}")],
+                [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")],
+            ])
+        )
+
     elif data.startswith("learned_"):
         _, lesson_key, idx = data.split("_", 2)
         idx = int(idx)
@@ -466,7 +549,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if next_idx < total:
             await show_phrase(query, lesson_key, next_idx)
         else:
-            # Если это была последняя фраза в уроке
             await query.edit_message_text(
                 f"🎉 Поздравляю! Вы завершили урок «{lesson['title']}»!\n\n"
                 f"📊 Всего выучено фраз: {len(learned)}\n"
@@ -523,6 +605,101 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("quiz_"):
         await handle_quiz_answer(query, user_id, data, context)
+
+# ─── Voice Message Handler (для проверки произношения) ──────────────────────
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает голосовые сообщения для проверки произношения"""
+    user_id = update.effective_user.id
+    voice = update.message.voice
+    
+    # Проверяем, ждём ли мы проверку произношения
+    if "check_word" not in context.user_data:
+        await update.message.reply_text(
+            "🎤 Чтобы проверить произношение, нажмите кнопку «Проверить» в уроке!",
+            reply_markup=main_menu_keyboard()
+        )
+        return
+    
+    # Получаем ожидаемое слово
+    expected_word = context.user_data.get("check_word")
+    translit = context.user_data.get("check_translit", "")
+    ru = context.user_data.get("check_ru", "")
+    lesson_key = context.user_data.get("check_lesson")
+    idx = context.user_data.get("check_idx")
+    
+    await update.message.reply_text("🎤 Распознаю речь... Подождите секунду...")
+    
+    try:
+        # Скачиваем голосовое сообщение
+        voice_file = await voice.get_file()
+        audio_bytes = await voice_file.download_as_bytearray()
+        
+        # Распознаём речь в отдельном потоке (т.к. это может занять время)
+        loop = asyncio.get_event_loop()
+        recognized = await loop.run_in_executor(None, recognize_speech, bytes(audio_bytes))
+        
+        if recognized is None:
+            await update.message.reply_text(
+                "❌ Не удалось распознать речь.\n\n"
+                "Попробуйте:\n"
+                "• Говорить чётче и громче\n"
+                "• Убедиться, что микрофон работает\n"
+                "• Отправить более короткое сообщение\n\n"
+                f"Ожидалось: *{expected_word}* ({translit})",
+                parse_mode="Markdown"
+            )
+            return
+        
+        # Сравниваем с ожидаемым словом
+        expected_norm = normalize_hebrew(expected_word)
+        recognized_norm = normalize_hebrew(recognized)
+        
+        # Проверяем, содержит ли распознанный текст ожидаемое слово
+        # (учитывая, что могут быть лишние слова)
+        if expected_norm in recognized_norm or recognized_norm in expected_norm:
+            # Правильно!
+            await update.message.reply_text(
+                f"✅ *Отлично!* Вы правильно произнесли!\n\n"
+                f"🎯 Вы сказали: {recognized}\n"
+                f"📖 Ожидалось: {expected_word} ({translit})\n\n"
+                f"🇷🇺 Перевод: {ru}\n\n"
+                f"🌟 Отличная работа! Продолжайте в том же духе!",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("↩️ Вернуться к уроку", callback_data=f"phrase_{lesson_key}_{idx}")],
+                    [InlineKeyboardButton("✅ Выучил!", callback_data=f"learned_{lesson_key}_{idx}")],
+                ])
+            )
+            # Добавляем фразу в выученные, если её там нет
+            user = get_user(user_id)
+            key = f"{lesson_key}_{idx}"
+            if key not in user.get("learned", []):
+                learned = user.get("learned", [])
+                learned.append(key)
+                total_phrases = user.get("total_phrases", 0) + 1
+                update_user(user_id, {"learned": learned, "total_phrases": total_phrases})
+        else:
+            # Неправильно
+            await update.message.reply_text(
+                f"❌ *Не совсем правильно.*\n\n"
+                f"🎯 Вы сказали: {recognized}\n"
+                f"📖 Ожидалось: {expected_word} ({translit})\n\n"
+                f"🇷🇺 Перевод: {ru}\n\n"
+                f"💪 Попробуйте ещё раз! Слушайте произношение и повторяйте.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔊 Послушать ещё раз", callback_data=f"audio_{lesson_key}_{idx}")],
+                    [InlineKeyboardButton("🎤 Попробовать снова", callback_data=f"check_{lesson_key}_{idx}")],
+                ])
+            )
+            
+    except Exception as e:
+        logger.error(f"Voice processing error: {e}")
+        await update.message.reply_text(
+            "❌ Произошла ошибка при обработке голосового сообщения.\n\n"
+            "Попробуйте ещё раз или используйте текстовый режим.",
+            reply_markup=main_menu_keyboard()
+        )
 
 async def progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -790,6 +967,9 @@ def main():
     app.add_handler(CommandHandler("quiz", quiz))
     app.add_handler(CommandHandler("progress", progress))
 
+    # Обработчики голосовых сообщений
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    
     app.add_handler(CallbackQueryHandler(next_quiz_callback, pattern=r"^(next_quiz|show_score)$"))
     app.add_handler(CallbackQueryHandler(settings_callback, pattern=r"^(toggle_reminders|reset_progress)$"))
     app.add_handler(CallbackQueryHandler(callback_handler))
