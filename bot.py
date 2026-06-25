@@ -119,7 +119,7 @@ def get_hebrew_tts(text: str) -> bytes:
         return resp.read()
 
 # ─── Groq Whisper STT для проверки произношения (бесплатно) ──────────────────
-def transcribe_audio_whisper(audio_bytes: bytes, filename: str = "voice.ogg") -> str:
+def transcribe_audio_whisper(audio_bytes: bytes, filename: str = "voice.oga") -> str:
     """Транскрибирует аудио через Groq Whisper API (бесплатно)"""
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY не задан")
@@ -127,11 +127,12 @@ def transcribe_audio_whisper(audio_bytes: bytes, filename: str = "voice.ogg") ->
     resp = _requests.post(
         "https://api.groq.com/openai/v1/audio/transcriptions",
         headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-        files={"file": (filename, audio_bytes, "audio/ogg")},
-        data={"model": "whisper-large-v3", "language": "he", "response_format": "json"},
+        files={"file": ("voice.mp3", audio_bytes, "audio/mpeg")},
+        data={"model": "whisper-large-v3-turbo", "language": "he", "response_format": "json"},
         timeout=30,
     )
-    resp.raise_for_status()
+    if not resp.ok:
+        raise RuntimeError(f"Groq {resp.status_code}: {resp.text[:400]}")
     return resp.json().get("text", "").strip()
 
 
@@ -719,20 +720,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(result_text, parse_mode="Markdown", reply_markup=buttons)
         context.user_data.pop("pron_check", None)
 
-    except _requests.exceptions.HTTPError as e:
-        body = e.response.text[:300] if e.response else str(e)
-        logger.error(f"Voice check HTTP {e.response.status_code}: {body}")
-        await update.message.reply_text(
-            f"❌ Ошибка HTTP {e.response.status_code} от Groq:\n<code>{body}</code>",
-            parse_mode="HTML",
-            reply_markup=main_menu_keyboard()
-        )
-    except _requests.exceptions.ConnectionError as e:
-        logger.error(f"Voice check connection error: {e}")
-        await update.message.reply_text(
-            "❌ Нет соединения с Groq. Проверьте интернет и попробуйте снова.",
-            reply_markup=main_menu_keyboard()
-        )
     except Exception as e:
         logger.error(f"Voice check error: {type(e).__name__}: {e}")
         await update.message.reply_text(
