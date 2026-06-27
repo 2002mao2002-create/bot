@@ -3,108 +3,91 @@
 Hebrew Learning Telegram Bot for Russian Speakers
 Бот для изучения иврита русскоговорящими
 
-Переменные окружения (задаются в панели BotHost или в файле .env):
-  TELEGRAM_TOKEN      — токен бота
-  ANTHROPIC_API_KEY   — ключ API Anthropic
+Два варианта курса:
+  Вариант 1 — глаголы только в настоящем времени (3 части)
+  Вариант 2 — глаголы в трёх временах (3 части)
+
+Части:
+  Часть 1: Приветствия + Числа + 10 глаголов + 100 слов
+  Часть 2: Числа (расширенные) + 50 глаголов + 200 слов
+  Часть 3: Остальные глаголы + слова + большие числа
+
+Переменные окружения (BotHost панель):
+  ANTHROPIC_API_KEY — ключ от console.anthropic.com
+  (токен бота BotHost задаёт сам в BOT_TOKEN)
 """
 
 import asyncio
+import io
 import json
 import logging
 import os
 import random
+import re
 import subprocess
 import sys
-import urllib.request
-import urllib.parse
-import urllib.error
-import io
+import tempfile
 import threading
-import requests as _requests
-from datetime import datetime, time, timedelta
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta
 from pathlib import Path
 
-# ─── Авто-установка зависимостей ─────────────────────────────────────────────
-def _ensure_package(package: str):
-    try:
-        __import__(package)
-    except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", package, "-q"])
-
-_ensure_package("groq")
-_ensure_package("gtts")
+# gTTS импортируется позже если нужен
 
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+    InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update,
 )
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ContextTypes, filters
+    Application, CallbackQueryHandler, CommandHandler, ContextTypes,
+    MessageHandler, filters,
 )
-from gtts import gTTS
-import tempfile
 
-# ─── Logging ──────────────────────────────────────────────────────────────────
+# ── Логирование ──────────────────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-# ─── .env loader (только для локальной разработки) ────────────────────────────
-_env_file = Path(__file__).parent / ".env"
-if _env_file.exists():
-    logger.info(".env файл найден, загружаем...")
-    with open(_env_file) as _f:
-        for _line in _f:
-            _line = _line.strip()
-            if _line and not _line.startswith("#") and "=" in _line:
-                _key, _, _val = _line.partition("=")
-                os.environ.setdefault(_key.strip(), _val.strip())
-else:
-    logger.info(".env файл не найден — используем переменные окружения системы")
+# ── .env для локальной разработки ────────────────────────────────────────────
+_env = Path(__file__).parent / ".env"
+if _env.exists():
+    for _l in _env.read_text().splitlines():
+        _l = _l.strip()
+        if _l and not _l.startswith("#") and "=" in _l:
+            k, _, v = _l.partition("=")
+            os.environ.setdefault(k.strip(), v.strip())
 
-# ─── Config ───────────────────────────────────────────────────────────────────
+# ── Токены ───────────────────────────────────────────────────────────────────
+TELEGRAM_TOKEN = (
+    os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or
+    os.getenv("TELEGRAM_TOKEN") or os.getenv("TOKEN") or
+    os.getenv("BOT_API_TOKEN") or ""
+).strip()
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
+FEEDBACK_USERNAME = "@aaron_ast"
 DATA_FILE = Path("user_data.json")
 
-# BotHost автоматически задаёт токен бота в переменной BOT_TOKEN.
-TELEGRAM_TOKEN = (
-    os.getenv("BOT_TOKEN") or
-    os.getenv("TELEGRAM_BOT_TOKEN") or
-    os.getenv("TELEGRAM_TOKEN") or
-    os.getenv("TOKEN") or
-    os.getenv("BOT_API_TOKEN") or
-    ""
-).strip()
-
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-
-logger.info(f"TELEGRAM_TOKEN найден: {'ДА' if TELEGRAM_TOKEN else 'НЕТ'}")
-logger.info(f"ANTHROPIC_API_KEY найден: {'ДА' if ANTHROPIC_API_KEY else 'НЕТ'}")
+logger.info(f"TELEGRAM_TOKEN: {'OK' if TELEGRAM_TOKEN else 'НЕТ'}")
+logger.info(f"ANTHROPIC_API_KEY: {'OK' if ANTHROPIC_API_KEY else 'НЕТ'}")
 
 if not TELEGRAM_TOKEN:
-    raise RuntimeError(
-        "Токен бота не найден. Ожидались переменные: BOT_TOKEN, TELEGRAM_TOKEN, TOKEN. "
-    )
+    raise RuntimeError("Токен бота не найден (BOT_TOKEN / TELEGRAM_TOKEN).")
 if not ANTHROPIC_API_KEY:
-    raise RuntimeError("ANTHROPIC_API_KEY не найден в переменных окружения.")
+    raise RuntimeError("ANTHROPIC_API_KEY не задан.")
 
-ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
-ANTHROPIC_MODEL = "claude-sonnet-4-6"
-
-# ─── Anthropic API ────────────────────────────────────────────────────────────
-def call_claude(system: str, user_text: str, max_tokens: int = 600) -> str:
-    """Call Anthropic API using only stdlib urllib"""
+# ── Anthropic API (без sdk) ──────────────────────────────────────────────────
+def call_claude(system: str, user_text: str, max_tokens: int = 700) -> str:
     payload = json.dumps({
-        "model": ANTHROPIC_MODEL,
+        "model": "claude-sonnet-4-6",
         "max_tokens": max_tokens,
         "system": system,
         "messages": [{"role": "user", "content": user_text}],
-    }).encode("utf-8")
-
+    }).encode()
     req = urllib.request.Request(
-        ANTHROPIC_API_URL,
+        "https://api.anthropic.com/v1/messages",
         data=payload,
         headers={
             "Content-Type": "application/json",
@@ -113,608 +96,910 @@ def call_claude(system: str, user_text: str, max_tokens: int = 600) -> str:
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-    return data["content"][0]["text"]
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read())["content"][0]["text"]
 
-# ─── TTS для произношения (Google Translate через gTTS) ─────────────────────
-def get_hebrew_tts(text: str) -> bytes:
+# ── TTS ──────────────────────────────────────────────────────────────────────
+def get_audio(hebrew_text: str) -> bytes | None:
     """
-    Генерирует аудио (mp3) через gTTS библиотеку
+    Генерирует mp3 произношение иврита.
+    Сначала пробует Google Translate TTS (без библиотек),
+    затем gTTS как запасной вариант.
     """
+    # Метод 1: Google Translate TTS напрямую
     try:
-        # Создаём временный файл
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as tmp_file:
-            tmp_path = tmp_file.name
-        
-        # Генерируем речь через gTTS
-        tts = gTTS(text=text, lang='he', slow=False)
-        tts.save(tmp_path)
-        
-        # Читаем файл в bytes
-        with open(tmp_path, 'rb') as f:
-            audio_bytes = f.read()
-        
-        # Удаляем временный файл
-        os.unlink(tmp_path)
-        
-        return audio_bytes
-        
+        encoded = urllib.parse.quote(hebrew_text)
+        url = (
+            f"https://translate.google.com/translate_tts"
+            f"?ie=UTF-8&tl=he&client=tw-ob&q={encoded}"
+        )
+        req = urllib.request.Request(url, headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Referer": "https://translate.google.com/",
+        })
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = resp.read()
+        if len(data) > 1000:   # валидный mp3 всегда > 1 кб
+            return data
     except Exception as e:
-        logger.error(f"gTTS error: {e}")
-        # Пробуем альтернативный метод через Google Translate TTS
-        return get_hebrew_tts_google(text)
+        logger.warning(f"Google TTS method 1 failed: {e}")
 
-def get_hebrew_tts_google(text: str) -> bytes:
-    """Резервный метод через Google Translate TTS (urllib)"""
-    encoded_text = urllib.parse.quote(text)
-    url = f"https://translate.google.com/translate_tts?ie=UTF-8&tl=he&client=tw-ob&q={encoded_text}"
-    
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        }
-    )
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        return resp.read()
+    # Метод 2: gTTS
+    try:
+        from gtts import gTTS
+        buf = io.BytesIO()
+        gTTS(text=hebrew_text, lang="he", slow=False).write_to_fp(buf)
+        data = buf.getvalue()
+        if len(data) > 1000:
+            return data
+    except Exception as e:
+        logger.warning(f"gTTS method 2 failed: {e}")
 
-# ─── Функция для удаления огласовок ──────────────────────────────────────────
-def remove_niqqud(text: str) -> str:
-    """Удаляет огласовки (никуд) из ивритского текста"""
-    import re
-    # Диапазон Unicode для огласовок: \u0591-\u05C7
-    return re.sub(r'[\u0591-\u05C7]', '', text)
-
-# ─── УРОВЕНЬ 1 ────────────────────────────────────────────────────────────────
-
-# Уроки уровня 1 (без огласовок)
-LESSONS_L1 = {
-    "greetings": {
-        "title": "👋 Приветствия",
-        "phrases": [
-            {"he": "שלום", "translit": "Шалом", "ru": "Привет / Мир"},
-            {"he": "בוקר טוב", "translit": "Бокер тов", "ru": "Доброе утро"},
-            {"he": "ערב טוב", "translit": "Эрев тов", "ru": "Добрый вечер"},
-            {"he": "לילה טוב", "translit": "Лайла тов", "ru": "Спокойной ночи"},
-            {"he": "מה שלומך?", "translit": "Ма шломха? (м) / Ма шломех? (ж)", "ru": "Как дела?"},
-            {"he": "בסדר", "translit": "Бесэдэр", "ru": "Хорошо / Нормально"},
-            {"he": "תודה", "translit": "Тода", "ru": "Спасибо"},
-            {"he": "בבקשה", "translit": "Бевакаша", "ru": "Пожалуйста"},
-            {"he": "סליחה", "translit": "Слиха", "ru": "Извините / Простите"},
-            {"he": "להתראות", "translit": "Лехитраот", "ru": "До свидания"},
-        ]
-    },
-    "numbers": {
-        "title": "🔢 Числа 1-10",
-        "phrases": [
-            {"he": "אחד", "translit": "Эхад", "ru": "Один (1)"},
-            {"he": "שתיים", "translit": "Штаим", "ru": "Два (2)"},
-            {"he": "שלוש", "translit": "Шалош", "ru": "Три (3)"},
-            {"he": "ארבע", "translit": "Арба", "ru": "Четыре (4)"},
-            {"he": "חמש", "translit": "Хамеш", "ru": "Пять (5)"},
-            {"he": "שש", "translit": "Шеш", "ru": "Шесть (6)"},
-            {"he": "שבע", "translit": "Шева", "ru": "Семь (7)"},
-            {"he": "שמונה", "translit": "Шмоне", "ru": "Восемь (8)"},
-            {"he": "תשע", "translit": "Теша", "ru": "Девять (9)"},
-            {"he": "עשר", "translit": "Эсэр", "ru": "Десять (10)"},
-        ]
-    },
-    "verbs_l1": {
-        "title": "🔥 10 главных глаголов",
-        "phrases": [
-            {"he": "להיות", "translit": "Лихйот", "ru": "Быть / являться"},
-            {"he": "לעשות", "translit": "Лаасот", "ru": "Делать"},
-            {"he": "לומר", "translit": "Ломар", "ru": "Говорить / сказать"},
-            {"he": "ללכת", "translit": "Лалехет", "ru": "Идти / ходить"},
-            {"he": "לדעת", "translit": "Лада'ат", "ru": "Знать"},
-            {"he": "לראות", "translit": "Лиръот", "ru": "Видеть"},
-            {"he": "לבוא", "translit": "Лаво", "ru": "Приходить / прийти"},
-            {"he": "לתת", "translit": "Латет", "ru": "Давать / дать"},
-            {"he": "לדבר", "translit": "Ледабер", "ru": "Разговаривать"},
-            {"he": "לרצות", "translit": "Лирцот", "ru": "Хотеть"},
-        ]
-    },
-    "words_l1": {
-        "title": "📖 100 главных слов",
-        "phrases": [
-            {"he": "אני", "translit": "Ани", "ru": "Я"},
-            {"he": "אתה / את", "translit": "Ата / Ат", "ru": "Ты (м/ж)"},
-            {"he": "הוא", "translit": "Ху", "ru": "Он"},
-            {"he": "היא", "translit": "Хи", "ru": "Она"},
-            {"he": "אנחנו", "translit": "Анахну", "ru": "Мы"},
-            {"he": "אתם / אתן", "translit": "Атем / Атен", "ru": "Вы (м/ж)"},
-            {"he": "הם / הן", "translit": "Хем / Хен", "ru": "Они (м/ж)"},
-            {"he": "כן", "translit": "Кен", "ru": "Да"},
-            {"he": "לא", "translit": "Ло", "ru": "Нет"},
-            {"he": "מה", "translit": "Ма", "ru": "Что"},
-            {"he": "מי", "translit": "Ми", "ru": "Кто"},
-            {"he": "איפה", "translit": "Эйфо", "ru": "Где"},
-            {"he": "מתי", "translit": "Матай", "ru": "Когда"},
-            {"he": "למה", "translit": "Лама", "ru": "Почему"},
-            {"he": "איך", "translit": "Эйх", "ru": "Как"},
-            {"he": "כמה", "translit": "Кама", "ru": "Сколько"},
-            {"he": "זה / זאת", "translit": "Зе / Зот", "ru": "Это (м/ж)"},
-            {"he": "כל", "translit": "Коль", "ru": "Всё / каждый"},
-            {"he": "עם", "translit": "Им", "ru": "С (предлог)"},
-            {"he": "ב", "translit": "Бе", "ru": "В / на (предлог)"},
-            {"he": "ל", "translit": "Ле", "ru": "К / для (предлог)"},
-            {"he": "מן / מ", "translit": "Мин / Ми", "ru": "Из / от (предлог)"},
-            {"he": "על", "translit": "Аль", "ru": "На / о (предлог)"},
-            {"he": "של", "translit": "Шель", "ru": "Из / принадлежащий"},
-            {"he": "את", "translit": "Эт", "ru": "Знак прямого дополнения"},
-            {"he": "גם", "translit": "Гам", "ru": "Тоже / также"},
-            {"he": "רק", "translit": "Рак", "ru": "Только / лишь"},
-            {"he": "כבר", "translit": "Квар", "ru": "Уже"},
-            {"he": "עדין", "translit": "Адаин", "ru": "Ещё / пока что"},
-            {"he": "אולי", "translit": "Улай", "ru": "Может быть"},
-            {"he": "אף פעם", "translit": "Аф паам", "ru": "Никогда"},
-            {"he": "תמיד", "translit": "Тамид", "ru": "Всегда"},
-            {"he": "עכשיו", "translit": "Ахшав", "ru": "Сейчас"},
-            {"he": "אחר כך", "translit": "Ахар ках", "ru": "Потом / после"},
-            {"he": "לפני", "translit": "Лифней", "ru": "Перед / до"},
-            {"he": "טוב", "translit": "Тов", "ru": "Хорошо / хороший"},
-            {"he": "רע", "translit": "Ра", "ru": "Плохо / плохой"},
-            {"he": "גדול", "translit": "Гадоль", "ru": "Большой"},
-            {"he": "קטן", "translit": "Катан", "ru": "Маленький"},
-            {"he": "חדש", "translit": "Хадаш", "ru": "Новый"},
-            {"he": "ישן", "translit": "Яшан", "ru": "Старый"},
-            {"he": "יפה", "translit": "Яфе", "ru": "Красивый"},
-            {"he": "מהיר", "translit": "Махир", "ru": "Быстрый"},
-            {"he": "איטי", "translit": "Ити", "ru": "Медленный"},
-            {"he": "קר", "translit": "Кар", "ru": "Холодный"},
-            {"he": "חם", "translit": "Хам", "ru": "Горячий"},
-            {"he": "יום", "translit": "Йом", "ru": "День"},
-            {"he": "לילה", "translit": "Лайла", "ru": "Ночь"},
-            {"he": "שעה", "translit": "Шаа", "ru": "Час"},
-            {"he": "שבוע", "translit": "Шавуа", "ru": "Неделя"},
-            {"he": "חודש", "translit": "Ходеш", "ru": "Месяц"},
-            {"he": "שנה", "translit": "Шана", "ru": "Год"},
-            {"he": "בית", "translit": "Байт", "ru": "Дом"},
-            {"he": "עיר", "translit": "Ир", "ru": "Город"},
-            {"he": "רחוב", "translit": "Рехов", "ru": "Улица"},
-            {"he": "מדינה", "translit": "Медина", "ru": "Страна / государство"},
-            {"he": "ארץ", "translit": "Эрец", "ru": "Земля / страна"},
-            {"he": "אויר", "translit": "Авир", "ru": "Воздух"},
-            {"he": "מים", "translit": "Маим", "ru": "Вода"},
-            {"he": "אש", "translit": "Эш", "ru": "Огонь"},
-            {"he": "אדם", "translit": "Адам", "ru": "Человек / люди"},
-            {"he": "איש", "translit": "Иш", "ru": "Мужчина / муж"},
-            {"he": "אישה", "translit": "Иша", "ru": "Женщина / жена"},
-            {"he": "ילד", "translit": "Йелед", "ru": "Ребёнок / мальчик"},
-            {"he": "ילדה", "translit": "Ялда", "ru": "Девочка"},
-            {"he": "חבר", "translit": "Хавер", "ru": "Друг"},
-            {"he": "עבודה", "translit": "Авода", "ru": "Работа"},
-            {"he": "כסף", "translit": "Кесеф", "ru": "Деньги / серебро"},
-            {"he": "זמן", "translit": "Зман", "ru": "Время"},
-            {"he": "מקום", "translit": "Маком", "ru": "Место"},
-            {"he": "דרך", "translit": "Дерех", "ru": "Путь / дорога"},
-            {"he": "חיים", "translit": "Хаим", "ru": "Жизнь"},
-            {"he": "שם", "translit": "Шем", "ru": "Имя"},
-            {"he": "יד", "translit": "Яд", "ru": "Рука"},
-            {"he": "עין", "translit": "Аин", "ru": "Глаз"},
-            {"he": "לב", "translit": "Лев", "ru": "Сердце"},
-            {"he": "ראש", "translit": "Рош", "ru": "Голова"},
-            {"he": "פה", "translit": "Пе", "ru": "Рот"},
-            {"he": "אוכל", "translit": "Охель", "ru": "Еда"},
-            {"he": "לחם", "translit": "Лехем", "ru": "Хлеб"},
-            {"he": "מילה", "translit": "Мила", "ru": "Слово"},
-            {"he": "שפה", "translit": "Сафа", "ru": "Язык / губа"},
-            {"he": "שאלה", "translit": "Шеэла", "ru": "Вопрос"},
-            {"he": "תשובה", "translit": "Тшува", "ru": "Ответ"},
-            {"he": "בעיה", "translit": "Беая", "ru": "Проблема"},
-            {"he": "רעיון", "translit": "Раайон", "ru": "Идея"},
-            {"he": "ספר", "translit": "Сефер", "ru": "Книга"},
-            {"he": "מכתב", "translit": "Михтав", "ru": "Письмо"},
-            {"he": "דואר אלקטרוני", "translit": "Доар электрони", "ru": "Электронная почта"},
-            {"he": "טלפון", "translit": "Телефон", "ru": "Телефон"},
-            {"he": "מכונית", "translit": "Мехонит", "ru": "Машина / автомобиль"},
-            {"he": "אוטובוס", "translit": "Отобус", "ru": "Автобус"},
-            {"he": "בית ספר", "translit": "Бейт сефер", "ru": "Школа"},
-            {"he": "בית חולים", "translit": "Бейт холим", "ru": "Больница"},
-            {"he": "חדר", "translit": "Хадар", "ru": "Комната"},
-            {"he": "דלת", "translit": "Делет", "ru": "Дверь"},
-            {"he": "חלון", "translit": "Халон", "ru": "Окно"},
-            {"he": "שולחן", "translit": "Шульхан", "ru": "Стол"},
-            {"he": "כיסא", "translit": "Кисэ", "ru": "Стул"},
-            {"he": "בגד", "translit": "Бегед", "ru": "Одежда"},
-        ]
-    }
-}
-
-# ─── УРОВЕНЬ 2 ────────────────────────────────────────────────────────────────
-
-# Глаголы уровня 2 (версия 1: 50 глаголов, не включая первые 10)
-VERBS_L2_V1 = [
-    {"he": "לאכול", "translit": "Леэхоль", "ru": "Есть / кушать"},
-    {"he": "לשתות", "translit": "Лиштот", "ru": "Пить"},
-    {"he": "לישון", "translit": "Лишон", "ru": "Спать"},
-    {"he": "לעבוד", "translit": "Ла'авод", "ru": "Работать"},
-    {"he": "ללמוד", "translit": "Лилмод", "ru": "Учиться / изучать"},
-    {"he": "לקרוא", "translit": "Ликро", "ru": "Читать"},
-    {"he": "לכתוב", "translit": "Лихтов", "ru": "Писать"},
-    {"he": "לשמוע", "translit": "Лишмоа", "ru": "Слышать / слушать"},
-    {"he": "להבין", "translit": "Лехавин", "ru": "Понимать"},
-    {"he": "לחשוב", "translit": "Лахшов", "ru": "Думать"},
-    {"he": "להרגיש", "translit": "Лехаргиш", "ru": "Чувствовать"},
-    {"he": "לזכור", "translit": "Лизкор", "ru": "Помнить"},
-    {"he": "לשכוח", "translit": "Лишкоах", "ru": "Забывать"},
-    {"he": "לנסות", "translit": "Ленасот", "ru": "Пробовать / пытаться"},
-    {"he": "להצליח", "translit": "Лехацлиах", "ru": "Преуспевать"},
-    {"he": "לבקש", "translit": "Левакеш", "ru": "Просить"},
-    {"he": "לענות", "translit": "Ла'анот", "ru": "Отвечать"},
-    {"he": "לשאול", "translit": "Лиш'оль", "ru": "Спрашивать"},
-    {"he": "לפתוח", "translit": "Лифтоах", "ru": "Открывать"},
-    {"he": "לסגור", "translit": "Лисгор", "ru": "Закрывать"},
-    {"he": "לבוא", "translit": "Лаво", "ru": "Приходить"},
-    {"he": "לצאת", "translit": "Лацет", "ru": "Выходить"},
-    {"he": "לחזור", "translit": "Лахзор", "ru": "Возвращаться"},
-    {"he": "להגיע", "translit": "Лехагиа", "ru": "Прибывать / достигать"},
-    {"he": "לעזוב", "translit": "Ла'азов", "ru": "Покидать / оставлять"},
-    {"he": "לשבת", "translit": "Лашевет", "ru": "Сидеть"},
-    {"he": "לעמוד", "translit": "Ла'амод", "ru": "Стоять"},
-    {"he": "לרוץ", "translit": "Ларуц", "ru": "Бежать"},
-    {"he": "לשיר", "translit": "Лашир", "ru": "Петь"},
-    {"he": "לרקוד", "translit": "Лиркод", "ru": "Танцевать"},
-    {"he": "לצפות", "translit": "Лицпот", "ru": "Смотреть / наблюдать"},
-    {"he": "להתבונן", "translit": "Лехитбонен", "ru": "Наблюдать / всматриваться"},
-    {"he": "להתחיל", "translit": "Лехатхиль", "ru": "Начинать"},
-    {"he": "לסיים", "translit": "Лесайем", "ru": "Заканчивать"},
-    {"he": "להמשיך", "translit": "Лехамших", "ru": "Продолжать"},
-    {"he": "לחכות", "translit": "Лехако", "ru": "Ждать"},
-    {"he": "להתעורר", "translit": "Лехиторер", "ru": "Просыпаться"},
-    {"he": "להתלבש", "translit": "Лехитлабеш", "ru": "Одеваться"},
-    {"he": "להתקלח", "translit": "Лехиткалеах", "ru": "Принимать душ"},
-    {"he": "להסתדר", "translit": "Лехистадер", "ru": "Справляться / обходиться"},
-    {"he": "להנות", "translit": "Леханот", "ru": "Наслаждаться"},
-    {"he": "לפחד", "translit": "Лифход", "ru": "Бояться"},
-    {"he": "לאהוב", "translit": "Леэхов", "ru": "Любить"},
-    {"he": "לשנוא", "translit": "Лисно", "ru": "Ненавидеть"},
-    {"he": "לכעוס", "translit": "Лик'ос", "ru": "Злиться"},
-    {"he": "לשמוח", "translit": "Лисмоах", "ru": "Радоваться"},
-    {"he": "להצטער", "translit": "Лехицатер", "ru": "Сожалеть / грустить"},
-    {"he": "להתנצל", "translit": "Лехитнацель", "ru": "Извиняться"},
-    {"he": "להזמין", "translit": "Лехазмин", "ru": "Приглашать / заказывать"},
-    {"he": "לשלם", "translit": "Лешалем", "ru": "Платить"},
-]
-
-# Глаголы уровня 2 (версия 2: 100 глаголов, не включая первые 20)
-VERBS_L2_V2 = VERBS_L2_V1 + [
-    {"he": "להשאיר", "translit": "Лехашир", "ru": "Оставлять"},
-    {"he": "להסיר", "translit": "Лехасир", "ru": "Убирать / снимать"},
-    {"he": "להכניס", "translit": "Лехахнис", "ru": "Вносить / впускать"},
-    {"he": "להוציא", "translit": "Лехоци", "ru": "Вынимать / выводить"},
-    {"he": "להעלות", "translit": "Лехаалот", "ru": "Поднимать"},
-    {"he": "להוריד", "translit": "Лехорид", "ru": "Опускать / спускать"},
-    {"he": "להביא", "translit": "Лехави", "ru": "Приносить"},
-    {"he": "לקחת", "translit": "Лакахат", "ru": "Брать"},
-    {"he": "למכור", "translit": "Лимкор", "ru": "Продавать"},
-    {"he": "לקנות", "translit": "Ликнот", "ru": "Покупать"},
-    {"he": "לבשל", "translit": "Левашель", "ru": "Готовить (еду)"},
-    {"he": "לטגן", "translit": "Летаген", "ru": "Жарить"},
-    {"he": "לאפות", "translit": "Леэфот", "ru": "Печь"},
-    {"he": "לשפוך", "translit": "Лишпох", "ru": "Наливать / проливать"},
-    {"he": "לערבב", "translit": "Леарбэв", "ru": "Смешивать"},
-    {"he": "לחתוך", "translit": "Лахтох", "ru": "Резать"},
-    {"he": "לשבור", "translit": "Лишбор", "ru": "Ломать"},
-    {"he": "לתקן", "translit": "Летакан", "ru": "Исправлять / чинить"},
-    {"he": "לבנות", "translit": "Ливнот", "ru": "Строить"},
-    {"he": "להרוס", "translit": "Лехорэс", "ru": "Разрушать"},
-    {"he": "לצייר", "translit": "Лецайер", "ru": "Рисовать"},
-    {"he": "לצלם", "translit": "Лецалем", "ru": "Фотографировать / снимать"},
-    {"he": "לשחק", "translit": "Лесахэк", "ru": "Играть"},
-    {"he": "לנצח", "translit": "Ленацеах", "ru": "Побеждать"},
-    {"he": "להפסיד", "translit": "Лехафсид", "ru": "Проигрывать / терять"},
-    {"he": "לספור", "translit": "Лиспор", "ru": "Считать"},
-    {"he": "למדוד", "translit": "Лимдод", "ru": "Измерять"},
-    {"he": "לשקול", "translit": "Лишколь", "ru": "Взвешивать"},
-    {"he": "להחליט", "translit": "Лехахлит", "ru": "Решать"},
-    {"he": "לבחור", "translit": "Ливхор", "ru": "Выбирать"},
-    {"he": "להתגבר", "translit": "Лехитгабер", "ru": "Преодолевать"},
-    {"he": "להסתכל", "translit": "Лехистакель", "ru": "Смотреть"},
-    {"he": "להקשיב", "translit": "Лехакшив", "ru": "Слушать (внимательно)"},
-    {"he": "להתייחס", "translit": "Лехитъяхас", "ru": "Относиться"},
-    {"he": "להתעניין", "translit": "Лехитъаньен", "ru": "Интересоваться"},
-    {"he": "להתאמן", "translit": "Лехитамен", "ru": "Тренироваться"},
-    {"he": "להשתפר", "translit": "Лехиштапер", "ru": "Улучшаться"},
-    {"he": "להתפתח", "translit": "Лехитпатеах", "ru": "Развиваться"},
-    {"he": "לגדול", "translit": "Лигдоль", "ru": "Расти"},
-    {"he": "להתכווץ", "translit": "Лехиткавец", "ru": "Сжиматься"},
-    {"he": "להרחיב", "translit": "Лехархив", "ru": "Расширять"},
-    {"he": "לצמצם", "translit": "Лецамцем", "ru": "Сокращать"},
-    {"he": "לחלק", "translit": "Лехалек", "ru": "Делить / раздавать"},
-    {"he": "להחליף", "translit": "Лехахлиф", "ru": "Менять / обменивать"},
-    {"he": "להזיז", "translit": "Лехазиз", "ru": "Двигать"},
-    {"he": "לעצור", "translit": "Ла'ацор", "ru": "Останавливать"},
-    {"he": "להמשיך", "translit": "Лехамших", "ru": "Продолжать"},
-    {"he": "להתקדם", "translit": "Лехиткадек", "ru": "Продвигаться"},
-    {"he": "להתרחק", "translit": "Лехитрахек", "ru": "Отдаляться"},
-    {"he": "להתקרב", "translit": "Лехиткарев", "ru": "Приближаться"},
-    {"he": "להתחבר", "translit": "Лехиткабер", "ru": "Подключаться / соединяться"},
-]
-
-# Слова уровня 2 (версия 1: 500 слов, не включая первые 100)
-WORDS_L2_V1 = [
-    {"he": "שולחן", "translit": "Шульхан", "ru": "Стол"},
-    {"he": "כיסא", "translit": "Кисэ", "ru": "Стул"},
-    {"he": "ספר", "translit": "Сефер", "ru": "Книга"},
-    {"he": "עט", "translit": "Эт", "ru": "Ручка"},
-    {"he": "מחשב", "translit": "Махшев", "ru": "Компьютер"},
-    {"he": "טלפון", "translit": "Телефон", "ru": "Телефон"},
-    {"he": "אוכל", "translit": "Охель", "ru": "Еда"},
-    {"he": "מים", "translit": "Маим", "ru": "Вода"},
-    {"he": "חלב", "translit": "Халав", "ru": "Молоко"},
-    {"he": "ביצה", "translit": "Бейца", "ru": "Яйцо"},
-    {"he": "לחם", "translit": "Лехем", "ru": "Хлеб"},
-    {"he": "פירות", "translit": "Пейрот", "ru": "Фрукты"},
-    {"he": "ירקות", "translit": "Ерако", "ru": "Овощи"},
-    {"he": "בשר", "translit": "Басар", "ru": "Мясо"},
-    {"he": "דג", "translit": "Даг", "ru": "Рыба"},
-    {"he": "גבינה", "translit": "Гвина", "ru": "Сыр"},
-    {"he": "שמן", "translit": "Шемен", "ru": "Масло"},
-    {"he": "סוכר", "translit": "Сукар", "ru": "Сахар"},
-    {"he": "מלח", "translit": "Мелах", "ru": "Соль"},
-    {"he": "פלפל", "translit": "Пильпель", "ru": "Перец"},
-    {"he": "קפה", "translit": "Кафе", "ru": "Кофе"},
-    {"he": "תה", "translit": "Те", "ru": "Чай"},
-    {"he": "יין", "translit": "Яин", "ru": "Вино"},
-    {"he": "בירה", "translit": "Бира", "ru": "Пиво"},
-    {"he": "הר", "translit": "Хар", "ru": "Гора"},
-    {"he": "עמק", "translit": "Эмек", "ru": "Долина"},
-    {"he": "ים", "translit": "Ям", "ru": "Море"},
-    {"he": "נהר", "translit": "Нахар", "ru": "Река"},
-    {"he": "אגם", "translit": "Агам", "ru": "Озеро"},
-    {"he": "עץ", "translit": "Эц", "ru": "Дерево"},
-    {"he": "פרח", "translit": "Перах", "ru": "Цветок"},
-    {"he": "דשא", "translit": "Деше", "ru": "Трава"},
-    {"he": "אבן", "translit": "Эвен", "ru": "Камень"},
-    {"he": "חול", "translit": "Холь", "ru": "Песок"},
-    {"he": "שמיים", "translit": "Шамаим", "ru": "Небо"},
-    {"he": "ענן", "translit": "Анан", "ru": "Облако"},
-    {"he": "גשם", "translit": "Гешем", "ru": "Дождь"},
-    {"he": "שלג", "translit": "Шелег", "ru": "Снег"},
-    {"he": "רוח", "translit": "Руах", "ru": "Ветер"},
-    {"he": "קרח", "translit": "Керах", "ru": "Лёд"},
-    {"he": "אש", "translit": "Эш", "ru": "Огонь"},
-    {"he": "עשן", "translit": "Ашан", "ru": "Дым"},
-    {"he": "חלום", "translit": "Халом", "ru": "Сон / мечта"},
-    {"he": "אמת", "translit": "Эмет", "ru": "Правда"},
-    {"he": "שקר", "translit": "Шекер", "ru": "Ложь"},
-    {"he": "חיים", "translit": "Хаим", "ru": "Жизнь"},
-    {"he": "מות", "translit": "Мавет", "ru": "Смерть"},
-    {"he": "לידה", "translit": "Лейда", "ru": "Рождение"},
-    {"he": "חתונה", "translit": "Хатуна", "ru": "Свадьба"},
-    {"he": "חג", "translit": "Хаг", "ru": "Праздник"},
-    {"he": "שבת", "translit": "Шабат", "ru": "Суббота"},
-    {"he": "יום שישי", "translit": "Йом шиши", "ru": "Пятница"},
-    {"he": "יום שבת", "translit": "Йом шабат", "ru": "Суббота"},
-    {"he": "יום ראשון", "translit": "Йом ришон", "ru": "Воскресенье"},
-    {"he": "יום שני", "translit": "Йом шени", "ru": "Понедельник"},
-    {"he": "יום שלישי", "translit": "Йом шлиши", "ru": "Вторник"},
-    {"he": "יום רביעי", "translit": "Йом ревии", "ru": "Среда"},
-    {"he": "יום חמישי", "translit": "Йон хамиши", "ru": "Четверг"},
-    {"he": "שעה", "translit": "Шаа", "ru": "Час"},
-    {"he": "דקה", "translit": "Дака", "ru": "Минута"},
-    {"he": "שנייה", "translit": "Шния", "ru": "Секунда"},
-    {"he": "בוקר", "translit": "Бокер", "ru": "Утро"},
-    {"he": "צהריים", "translit": "Цаараим", "ru": "Полдень"},
-    {"he": "ערב", "translit": "Эрев", "ru": "Вечер"},
-    {"he": "לילה", "translit": "Лайла", "ru": "Ночь"},
-    {"he": "שלום", "translit": "Шалом", "ru": "Мир / привет"},
-    {"he": "מלחמה", "translit": "Милхама", "ru": "Война"},
-    {"he": "שלטון", "translit": "Шилтон", "ru": "Правление"},
-    {"he": "חופש", "translit": "Хофеш", "ru": "Свобода"},
-    {"he": "שוויון", "translit": "Шивеон", "ru": "Равенство"},
-    {"he": "צדק", "translit": "Цедек", "ru": "Справедливость"},
-    {"he": "אהבה", "translit": "Ахава", "ru": "Любовь"},
-    {"he": "שנאה", "translit": "Сина", "ru": "Ненависть"},
-    {"he": "רחמים", "translit": "Рхамим", "ru": "Сострадание"},
-    {"he": "חמלה", "translit": "Хемла", "ru": "Жалость"},
-    {"he": "טוב", "translit": "Тов", "ru": "Хороший"},
-    {"he": "רע", "translit": "Ра", "ru": "Плохой"},
-    {"he": "חדש", "translit": "Хадаш", "ru": "Новый"},
-    {"he": "ישן", "translit": "Яшан", "ru": "Старый"},
-    {"he": "חם", "translit": "Хам", "ru": "Горячий"},
-    {"he": "קר", "translit": "Кар", "ru": "Холодный"},
-    {"he": "טרי", "translit": "Тари", "ru": "Свежий"},
-    {"he": "רקוב", "translit": "Ракув", "ru": "Гнилой"},
-    {"he": "נקי", "translit": "Наки", "ru": "Чистый"},
-    {"he": "מלוכלך", "translit": "Мелухлах", "ru": "Грязный"},
-    {"he": "קשה", "translit": "Каше", "ru": "Тяжёлый / трудный"},
-    {"he": "רך", "translit": "Рак", "ru": "Мягкий"},
-    {"he": "חזק", "translit": "Хазак", "ru": "Сильный"},
-    {"he": "חלש", "translit": "Халаш", "ru": "Слабый"},
-    {"he": "עשיר", "translit": "Ашир", "ru": "Богатый"},
-    {"he": "עני", "translit": "Ани", "ru": "Бедный"},
-    {"he": "יפה", "translit": "Яфе", "ru": "Красивый"},
-    {"he": "מכוער", "translit": "Махоар", "ru": "Уродливый"},
-    {"he": "אמיץ", "translit": "Амиц", "ru": "Смелый"},
-    {"he": "פחדן", "translit": "Пахдан", "ru": "Трусливый"},
-    {"he": "חכם", "translit": "Хахам", "ru": "Умный"},
-    {"he": "טיפש", "translit": "Типеш", "ru": "Глупый"},
-    {"he": "ידיד", "translit": "Ядид", "ru": "Приятель"},
-    {"he": "אויב", "translit": "Ойев", "ru": "Враг"},
-    {"he": "שכן", "translit": "Шахен", "ru": "Сосед"},
-    {"he": "אורח", "translit": "Ореах", "ru": "Гость"},
-    {"he": "מארח", "translit": "Марах", "ru": "Хозяин"},
-]
-
-# Числа уровня 2 (версия 1: 11-1000, не включая 1-10)
-NUMBERS_L2_V1 = [
-    {"he": "אחת עשרה", "translit": "Ахат эсре", "ru": "11"},
-    {"he": "שתים עשרה", "translit": "Штейм эсре", "ru": "12"},
-    {"he": "שלוש עשרה", "translit": "Шлош эсре", "ru": "13"},
-    {"he": "ארבע עשרה", "translit": "Арба эсре", "ru": "14"},
-    {"he": "חמש עשרה", "translit": "Хамеш эсре", "ru": "15"},
-    {"he": "שש עשרה", "translit": "Шеш эсре", "ru": "16"},
-    {"he": "שבע עשרה", "translit": "Шва эсре", "ru": "17"},
-    {"he": "שמונה עשרה", "translit": "Шмоне эсре", "ru": "18"},
-    {"he": "תשע עשרה", "translit": "Тша эсре", "ru": "19"},
-    {"he": "עשרים", "translit": "Эсрим", "ru": "20"},
-    {"he": "שלושים", "translit": "Шлошим", "ru": "30"},
-    {"he": "ארבעים", "translit": "Арбаим", "ru": "40"},
-    {"he": "חמישים", "translit": "Хамишим", "ru": "50"},
-    {"he": "שישים", "translit": "Шишим", "ru": "60"},
-    {"he": "שבעים", "translit": "Шивъим", "ru": "70"},
-    {"he": "שמונים", "translit": "Шмоним", "ru": "80"},
-    {"he": "תשעים", "translit": "Тишъим", "ru": "90"},
-    {"he": "מאה", "translit": "Меа", "ru": "100"},
-    {"he": "מאתיים", "translit": "Матаим", "ru": "200"},
-    {"he": "שלוש מאות", "translit": "Шлош меот", "ru": "300"},
-    {"he": "ארבע מאות", "translit": "Арба меот", "ru": "400"},
-    {"he": "חמש מאות", "translit": "Хамеш меот", "ru": "500"},
-    {"he": "שש מאות", "translit": "Шеш меот", "ru": "600"},
-    {"he": "שבע מאות", "translit": "Шва меот", "ru": "700"},
-    {"he": "שמונה מאות", "translit": "Шмоне меот", "ru": "800"},
-    {"he": "תשע מאות", "translit": "Тша меот", "ru": "900"},
-    {"he": "אלף", "translit": "Элеф", "ru": "1000"},
-]
-
-# Числа уровня 2 (версия 2: 1001-1000000 с шагом 1000)
-NUMBERS_L2_V2 = [
-    {"he": "אלף ואחת", "translit": "Элеф ве-ахат", "ru": "1001"},
-    {"he": "אלפיים", "translit": "Альпаим", "ru": "2000"},
-    {"he": "אלפיים ואחת", "translit": "Альпаим ве-ахат", "ru": "2001"},
-    {"he": "שלושת אלפים", "translit": "Шлошет алафим", "ru": "3000"},
-    {"he": "ארבעת אלפים", "translit": "Арбаат алафим", "ru": "4000"},
-    {"he": "חמשת אלפים", "translit": "Хамешет алафим", "ru": "5000"},
-    {"he": "ששת אלפים", "translit": "Шешет алафим", "ru": "6000"},
-    {"he": "שבעת אלפים", "translit": "Шивъат алафим", "ru": "7000"},
-    {"he": "שמונת אלפים", "translit": "Шмонат алафим", "ru": "8000"},
-    {"he": "תשעת אלפים", "translit": "Тишъат алафим", "ru": "9000"},
-    {"he": "עשרת אלפים", "translit": "Асерет алафим", "ru": "10000"},
-    {"he": "עשרים אלף", "translit": "Эсрим элеф", "ru": "20000"},
-    {"he": "שלושים אלף", "translit": "Шлошим элеф", "ru": "30000"},
-    {"he": "ארבעים אלף", "translit": "Арбаим элеф", "ru": "40000"},
-    {"he": "חמישים אלף", "translit": "Хамишим элеф", "ru": "50000"},
-    {"he": "שישים אלף", "translit": "Шишим элеф", "ru": "60000"},
-    {"he": "שבעים אלף", "translit": "Шивъим элеф", "ru": "70000"},
-    {"he": "שמונים אלף", "translit": "Шмоним элеф", "ru": "80000"},
-    {"he": "תשעים אלף", "translit": "Тишъим элеф", "ru": "90000"},
-    {"he": "מאה אלף", "translit": "Меа элеф", "ru": "100000"},
-    {"he": "מאתיים אלף", "translit": "Матаим элеф", "ru": "200000"},
-    {"he": "שלוש מאות אלף", "translit": "Шлош меот элеф", "ru": "300000"},
-    {"he": "ארבע מאות אלף", "translit": "Арба меот элеф", "ru": "400000"},
-    {"he": "חמש מאות אלף", "translit": "Хамеш меот элеф", "ru": "500000"},
-    {"he": "שש מאות אלף", "translit": "Шеш меот элеф", "ru": "600000"},
-    {"he": "שבע מאות אלף", "translit": "Шва меот элеф", "ru": "700000"},
-    {"he": "שמונה מאות אלף", "translit": "Шмоне меот элеф", "ru": "800000"},
-    {"he": "תשע מאות אלף", "translit": "Тша меот элеф", "ru": "900000"},
-    {"he": "מיליון", "translit": "Милйон", "ru": "1,000,000"},
-]
-
-# ─── Функции для получения уроков по уровню и версии ──────────────────────────
-
-def get_lessons(version: int, level: int) -> dict:
-    """Возвращает словарь уроков для заданной версии и уровня"""
-    if level == 1:
-        return LESSONS_L1.copy()
-    elif level == 2:
-        # Для уровня 2 создаём динамические уроки
-        lessons = {
-            "verbs_l2": {
-                "title": "🔥 Глаголы уровня 2",
-                "phrases": VERBS_L2_V1 if version == 1 else VERBS_L2_V2
-            },
-            "words_l2": {
-                "title": "📖 Слова уровня 2",
-                "phrases": WORDS_L2_V1 if version == 1 else WORDS_L2_V1 + []
-            },
-            "numbers_l2": {
-                "title": "🔢 Числа уровня 2",
-                "phrases": NUMBERS_L2_V1 if version == 1 else NUMBERS_L2_V2
-            }
-        }
-        return lessons
-    return {}
-
-def get_all_lessons(version: int, level: int) -> dict:
-    """Возвращает все уроки для заданной версии и уровня"""
-    if level == 1:
-        return LESSONS_L1.copy()
-    else:
-        return get_lessons(version, 2)
-
-def get_lesson_by_key(version: int, level: int, lesson_key: str) -> dict:
-    """Возвращает урок по ключу"""
-    # Сначала пробуем получить уроки для уровня
-    lessons = get_all_lessons(version, level)
-    if lesson_key in lessons:
-        return lessons[lesson_key]
-    
-    # Для уровня 2 пробуем найти в динамических уроках
-    if level == 2:
-        if lesson_key == "verbs_l2":
-            return {
-                "title": "🔥 Глаголы уровня 2",
-                "phrases": VERBS_L2_V1 if version == 1 else VERBS_L2_V2
-            }
-        elif lesson_key == "words_l2":
-            return {
-                "title": "📖 Слова уровня 2",
-                "phrases": WORDS_L2_V1 if version == 1 else WORDS_L2_V1 + []
-            }
-        elif lesson_key == "numbers_l2":
-            return {
-                "title": "🔢 Числа уровня 2",
-                "phrases": NUMBERS_L2_V1 if version == 1 else NUMBERS_L2_V2
-            }
-    
-    # Проверяем уровень 1 (для обратной совместимости)
-    if lesson_key in LESSONS_L1:
-        return LESSONS_L1[lesson_key]
-    
-    logger.warning(f"Урок не найден: {lesson_key}, уровень: {level}, версия: {version}")
     return None
 
-def get_phrase_by_key(version: int, level: int, lesson_key: str, phrase_idx: int) -> dict:
-    """Возвращает фразу по ключу урока и индексу"""
-    lesson = get_lesson_by_key(version, level, lesson_key)
-    if not lesson:
-        logger.error(f"Урок не найден: {lesson_key}")
-        return None
-    try:
-        phrases = lesson.get("phrases", [])
-        if phrase_idx < len(phrases):
-            return phrases[phrase_idx]
-        else:
-            logger.error(f"Индекс {phrase_idx} вне диапазона (всего {len(phrases)})")
-            return None
-    except (IndexError, KeyError) as e:
-        logger.error(f"Ошибка получения фразы: {e}")
-        return None
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ДАННЫЕ — ВАРИАНТ 1 (глаголы только в настоящем времени)
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def get_quiz_pool(version: int, level: int, quiz_type: str) -> list:
-    """Возвращает пул фраз для теста"""
-    if quiz_type == "verbs":
-        if level == 1:
-            return LESSONS_L1["verbs_l1"]["phrases"]
-        else:
-            return VERBS_L2_V1 if version == 1 else VERBS_L2_V2
-    elif quiz_type == "words":
-        if level == 1:
-            return LESSONS_L1["words_l1"]["phrases"]
-        else:
-            return WORDS_L2_V1 if version == 1 else WORDS_L2_V1 + []
-    elif quiz_type == "numbers":
-        if level == 1:
-            return LESSONS_L1["numbers"]["phrases"]
-        else:
-            return NUMBERS_L2_V1 if version == 1 else NUMBERS_L2_V2
-    return []
-
-DAILY_TIPS = [
-    "💡 Иврит читается справа налево! Это одна из первых вещей, которую нужно запомнить.",
-    "💡 В иврите нет заглавных букв — все буквы одного размера.",
-    "💡 Слово «шалом» (שלום) означает одновременно «привет», «пока» и «мир».",
-    "💡 В иврите глаголы меняются в зависимости от пола говорящего (мужской/женский).",
-    "💡 Буква «алеф» (א) — первая в ивритском алфавите, как «А» в русском.",
-    "💡 «Тода раба» (תודה רבה) означает «большое спасибо».",
-    "💡 Число 7 считается счастливым в иудейской традиции — на иврите שבע (шева).",
-    "💡 Слово «сабра» — так называют уроженцев Израиля. Это тоже вид кактуса!",
+# ─── Часть 1 ─────────────────────────────────────────────────────────────────
+V1_P1_GREETINGS = [
+    {"he": "שלום",          "tr": "Шалом",              "ru": "Привет / Мир"},
+    {"he": "בוקר טוב",      "tr": "Бокер тов",          "ru": "Доброе утро"},
+    {"he": "ערב טוב",       "tr": "Эрев тов",           "ru": "Добрый вечер"},
+    {"he": "לילה טוב",      "tr": "Лайла тов",          "ru": "Спокойной ночи"},
+    {"he": "מה שלומך?",     "tr": "Ма шломха? (м) / Ма шломех? (ж)", "ru": "Как дела?"},
+    {"he": "בסדר",          "tr": "Бесэдэр",            "ru": "Хорошо / Нормально"},
+    {"he": "תודה",          "tr": "Тода",               "ru": "Спасибо"},
+    {"he": "בבקשה",         "tr": "Бевакаша",           "ru": "Пожалуйста"},
+    {"he": "סליחה",         "tr": "Слиха",              "ru": "Извините"},
+    {"he": "להתראות",       "tr": "Лехитраот",          "ru": "До свидания"},
 ]
 
-# ─── User Data ────────────────────────────────────────────────────────────────
+V1_P1_NUMBERS = [
+    {"he": "אחד",   "tr": "Эхад",   "ru": "1"},
+    {"he": "שתיים", "tr": "Штаим",  "ru": "2"},
+    {"he": "שלוש",  "tr": "Шалош",  "ru": "3"},
+    {"he": "ארבע",  "tr": "Арба",   "ru": "4"},
+    {"he": "חמש",   "tr": "Хамеш",  "ru": "5"},
+    {"he": "שש",    "tr": "Шеш",    "ru": "6"},
+    {"he": "שבע",   "tr": "Шева",   "ru": "7"},
+    {"he": "שמונה", "tr": "Шмоне",  "ru": "8"},
+    {"he": "תשע",   "tr": "Теша",   "ru": "9"},
+    {"he": "עשר",   "tr": "Эсэр",   "ru": "10"},
+]
+
+V1_P1_VERBS = [
+    {"he": "להיות",  "tr": "Лихйот",  "ru": "Быть",           "now": "הוא הולך (Ху холех) — Он идёт"},
+    {"he": "לעשות",  "tr": "Лаасот",  "ru": "Делать",         "now": "אני עושה (Ани осе) — Я делаю"},
+    {"he": "לומר",   "tr": "Ломар",   "ru": "Говорить/сказать","now": "הוא אומר (Ху омер) — Он говорит"},
+    {"he": "ללכת",   "tr": "Лалехет", "ru": "Идти/ходить",    "now": "אני הולך (Ани холех) — Я иду"},
+    {"he": "לדעת",   "tr": "Лада'ат", "ru": "Знать",          "now": "אני יודע (Ани йодеа) — Я знаю"},
+    {"he": "לראות",  "tr": "Лиръот",  "ru": "Видеть",         "now": "הוא רואה (Ху роэ) — Он видит"},
+    {"he": "לבוא",   "tr": "Лаво",    "ru": "Приходить",      "now": "היא באה (Хи баа) — Она приходит"},
+    {"he": "לתת",    "tr": "Латет",   "ru": "Давать",         "now": "אני נותן (Ани нотен) — Я даю"},
+    {"he": "לדבר",   "tr": "Ледабер", "ru": "Разговаривать",  "now": "הם מדברים (Хем медабрим) — Они разговаривают"},
+    {"he": "לרצות",  "tr": "Лирцот",  "ru": "Хотеть",         "now": "אני רוצה (Ани роце) — Я хочу"},
+]
+
+V1_P1_WORDS = [
+    {"he": "אני",        "tr": "Ани",          "ru": "Я"},
+    {"he": "אתה / את",   "tr": "Ата / Ат",     "ru": "Ты (м/ж)"},
+    {"he": "הוא",        "tr": "Ху",           "ru": "Он"},
+    {"he": "היא",        "tr": "Хи",           "ru": "Она"},
+    {"he": "אנחנו",      "tr": "Анахну",       "ru": "Мы"},
+    {"he": "הם / הן",    "tr": "Хем / Хен",    "ru": "Они (м/ж)"},
+    {"he": "כן",         "tr": "Кен",          "ru": "Да"},
+    {"he": "לא",         "tr": "Ло",           "ru": "Нет"},
+    {"he": "מה",         "tr": "Ма",           "ru": "Что"},
+    {"he": "מי",         "tr": "Ми",           "ru": "Кто"},
+    {"he": "איפה",       "tr": "Эйфо",         "ru": "Где"},
+    {"he": "מתי",        "tr": "Матай",        "ru": "Когда"},
+    {"he": "למה",        "tr": "Лама",         "ru": "Почему"},
+    {"he": "איך",        "tr": "Эйх",          "ru": "Как"},
+    {"he": "כמה",        "tr": "Кама",         "ru": "Сколько"},
+    {"he": "זה / זאת",   "tr": "Зе / Зот",     "ru": "Это (м/ж)"},
+    {"he": "כל",         "tr": "Коль",         "ru": "Всё / каждый"},
+    {"he": "עם",         "tr": "Им",           "ru": "С (предлог)"},
+    {"he": "ב",          "tr": "Бе",           "ru": "В / на"},
+    {"he": "ל",          "tr": "Ле",           "ru": "К / для"},
+    {"he": "מ",          "tr": "Ми",           "ru": "Из / от"},
+    {"he": "על",         "tr": "Аль",          "ru": "На / о"},
+    {"he": "של",         "tr": "Шель",         "ru": "Принадлежащий"},
+    {"he": "גם",         "tr": "Гам",          "ru": "Тоже / также"},
+    {"he": "רק",         "tr": "Рак",          "ru": "Только"},
+    {"he": "כבר",        "tr": "Квар",         "ru": "Уже"},
+    {"he": "עדין",       "tr": "Адаин",        "ru": "Ещё / пока что"},
+    {"he": "אולי",       "tr": "Улай",         "ru": "Может быть"},
+    {"he": "תמיד",       "tr": "Тамид",        "ru": "Всегда"},
+    {"he": "עכשיו",      "tr": "Ахшав",        "ru": "Сейчас"},
+    {"he": "אחר כך",     "tr": "Ахар ках",     "ru": "Потом"},
+    {"he": "לפני",       "tr": "Лифней",       "ru": "До / перед"},
+    {"he": "טוב",        "tr": "Тов",          "ru": "Хорошо / хороший"},
+    {"he": "רע",         "tr": "Ра",           "ru": "Плохо / плохой"},
+    {"he": "גדול",       "tr": "Гадоль",       "ru": "Большой"},
+    {"he": "קטן",        "tr": "Катан",        "ru": "Маленький"},
+    {"he": "חדש",        "tr": "Хадаш",        "ru": "Новый"},
+    {"he": "ישן",        "tr": "Яшан",         "ru": "Старый"},
+    {"he": "יפה",        "tr": "Яфе",          "ru": "Красивый"},
+    {"he": "מהיר",       "tr": "Махир",        "ru": "Быстрый"},
+    {"he": "יום",        "tr": "Йом",          "ru": "День"},
+    {"he": "לילה",       "tr": "Лайла",        "ru": "Ночь"},
+    {"he": "שעה",        "tr": "Шаа",          "ru": "Час"},
+    {"he": "שבוע",       "tr": "Шавуа",        "ru": "Неделя"},
+    {"he": "חודש",       "tr": "Ходеш",        "ru": "Месяц"},
+    {"he": "שנה",        "tr": "Шана",         "ru": "Год"},
+    {"he": "בית",        "tr": "Байт",         "ru": "Дом"},
+    {"he": "עיר",        "tr": "Ир",           "ru": "Город"},
+    {"he": "רחוב",       "tr": "Рехов",        "ru": "Улица"},
+    {"he": "מדינה",      "tr": "Медина",       "ru": "Страна"},
+    {"he": "מים",        "tr": "Маим",         "ru": "Вода"},
+    {"he": "אש",         "tr": "Эш",           "ru": "Огонь"},
+    {"he": "אדם",        "tr": "Адам",         "ru": "Человек"},
+    {"he": "איש",        "tr": "Иш",           "ru": "Мужчина"},
+    {"he": "אישה",       "tr": "Иша",          "ru": "Женщина"},
+    {"he": "ילד",        "tr": "Йелед",        "ru": "Ребёнок/мальчик"},
+    {"he": "ילדה",       "tr": "Ялда",         "ru": "Девочка"},
+    {"he": "חבר",        "tr": "Хавер",        "ru": "Друг"},
+    {"he": "עבודה",      "tr": "Авода",        "ru": "Работа"},
+    {"he": "כסף",        "tr": "Кесеф",        "ru": "Деньги"},
+    {"he": "זמן",        "tr": "Зман",         "ru": "Время"},
+    {"he": "מקום",       "tr": "Маком",        "ru": "Место"},
+    {"he": "דרך",        "tr": "Дерех",        "ru": "Путь / дорога"},
+    {"he": "חיים",       "tr": "Хаим",         "ru": "Жизнь"},
+    {"he": "שם",         "tr": "Шем",          "ru": "Имя"},
+    {"he": "יד",         "tr": "Яд",           "ru": "Рука"},
+    {"he": "עין",        "tr": "Аин",          "ru": "Глаз"},
+    {"he": "לב",         "tr": "Лев",          "ru": "Сердце"},
+    {"he": "ראש",        "tr": "Рош",          "ru": "Голова"},
+    {"he": "אוכל",       "tr": "Охель",        "ru": "Еда"},
+    {"he": "לחם",        "tr": "Лехем",        "ru": "Хлеб"},
+    {"he": "מילה",       "tr": "Мила",         "ru": "Слово"},
+    {"he": "שפה",        "tr": "Сафа",         "ru": "Язык"},
+    {"he": "שאלה",       "tr": "Шеэла",        "ru": "Вопрос"},
+    {"he": "תשובה",      "tr": "Тшува",        "ru": "Ответ"},
+    {"he": "בעיה",       "tr": "Беая",         "ru": "Проблема"},
+    {"he": "רעיון",      "tr": "Раайон",       "ru": "Идея"},
+    {"he": "ספר",        "tr": "Сефер",        "ru": "Книга"},
+    {"he": "טלפון",      "tr": "Телефон",      "ru": "Телефон"},
+    {"he": "מכונית",     "tr": "Мехонит",      "ru": "Машина"},
+    {"he": "אוטובוס",    "tr": "Отобус",       "ru": "Автобус"},
+    {"he": "בית ספר",    "tr": "Бейт сефер",   "ru": "Школа"},
+    {"he": "בית חולים",  "tr": "Бейт холим",   "ru": "Больница"},
+    {"he": "חדר",        "tr": "Хадар",        "ru": "Комната"},
+    {"he": "דלת",        "tr": "Делет",        "ru": "Дверь"},
+    {"he": "חלון",       "tr": "Халон",        "ru": "Окно"},
+    {"he": "שולחן",      "tr": "Шульхан",      "ru": "Стол"},
+    {"he": "כיסא",       "tr": "Кисэ",         "ru": "Стул"},
+    {"he": "בגד",        "tr": "Бегед",        "ru": "Одежда"},
+    {"he": "חלב",        "tr": "Халав",        "ru": "Молоко"},
+    {"he": "ביצה",       "tr": "Бейца",        "ru": "Яйцо"},
+    {"he": "סוכר",       "tr": "Сукар",        "ru": "Сахар"},
+    {"he": "מלח",        "tr": "Мелах",        "ru": "Соль"},
+    {"he": "קפה",        "tr": "Кафе",         "ru": "Кофе"},
+    {"he": "תה",         "tr": "Те",           "ru": "Чай"},
+    {"he": "פירות",      "tr": "Пейрот",       "ru": "Фрукты"},
+    {"he": "ירקות",      "tr": "Ерако",        "ru": "Овощи"},
+    {"he": "בשר",        "tr": "Басар",        "ru": "Мясо"},
+    {"he": "דג",         "tr": "Даг",          "ru": "Рыба"},
+    {"he": "כלב",        "tr": "Келев",        "ru": "Собака"},
+    {"he": "חתול",       "tr": "Хатуль",       "ru": "Кошка"},
+]
+
+# ─── Часть 2 ─────────────────────────────────────────────────────────────────
+V1_P2_NUMBERS = [
+    {"he": "אחת עשרה",   "tr": "Ахат эсре",   "ru": "11"},
+    {"he": "שתים עשרה",  "tr": "Штейм эсре",  "ru": "12"},
+    {"he": "שלוש עשרה",  "tr": "Шлош эсре",   "ru": "13"},
+    {"he": "ארבע עשרה",  "tr": "Арба эсре",   "ru": "14"},
+    {"he": "חמש עשרה",   "tr": "Хамеш эсре",  "ru": "15"},
+    {"he": "שש עשרה",    "tr": "Шеш эсре",    "ru": "16"},
+    {"he": "שבע עשרה",   "tr": "Шва эсре",    "ru": "17"},
+    {"he": "שמונה עשרה", "tr": "Шмоне эсре",  "ru": "18"},
+    {"he": "תשע עשרה",   "tr": "Тша эсре",    "ru": "19"},
+    {"he": "עשרים",      "tr": "Эсрим",       "ru": "20"},
+    {"he": "שלושים",     "tr": "Шлошим",      "ru": "30"},
+    {"he": "ארבעים",     "tr": "Арбаим",      "ru": "40"},
+    {"he": "חמישים",     "tr": "Хамишим",     "ru": "50"},
+    {"he": "שישים",      "tr": "Шишим",       "ru": "60"},
+    {"he": "שבעים",      "tr": "Шивъим",      "ru": "70"},
+    {"he": "שמונים",     "tr": "Шмоним",      "ru": "80"},
+    {"he": "תשעים",      "tr": "Тишъим",      "ru": "90"},
+    {"he": "מאה",        "tr": "Меа",         "ru": "100"},
+    {"he": "מאה ואחד",   "tr": "Меа ве-эхад", "ru": "101"},
+    {"he": "מאתיים",     "tr": "Матаим",      "ru": "200"},
+    {"he": "מאתיים ואחד","tr": "Матаим ве-эхад","ru": "201"},
+    {"he": "שלוש מאות",  "tr": "Шлош меот",   "ru": "300"},
+    {"he": "שלוש מאות ואחד","tr": "Шлош меот ве-эхад","ru": "301"},
+    {"he": "ארבע מאות",  "tr": "Арба меот",   "ru": "400"},
+    {"he": "חמש מאות",   "tr": "Хамеш меот",  "ru": "500"},
+    {"he": "שש מאות",    "tr": "Шеш меот",    "ru": "600"},
+    {"he": "שבע מאות",   "tr": "Шва меот",    "ru": "700"},
+    {"he": "שמונה מאות", "tr": "Шмоне меот",  "ru": "800"},
+    {"he": "תשע מאות",   "tr": "Тша меот",    "ru": "900"},
+    {"he": "אלף",        "tr": "Элеф",        "ru": "1000"},
+]
+
+V1_P2_VERBS = [
+    {"he": "לאכול",    "tr": "Леэхоль",    "ru": "Есть/кушать",      "now": "אני אוכל (Ани охель)"},
+    {"he": "לשתות",    "tr": "Лиштот",     "ru": "Пить",             "now": "הוא שותה (Ху шоте)"},
+    {"he": "לישון",    "tr": "Лишон",      "ru": "Спать",            "now": "היא ישנה (Хи яшена)"},
+    {"he": "לעבוד",    "tr": "Ла'авод",    "ru": "Работать",         "now": "אני עובד (Ани овед)"},
+    {"he": "ללמוד",    "tr": "Лилмод",     "ru": "Учиться",          "now": "הם לומדים (Хем ломдим)"},
+    {"he": "לקרוא",    "tr": "Ликро",      "ru": "Читать",           "now": "אני קורא (Ани коре)"},
+    {"he": "לכתוב",    "tr": "Лихтов",     "ru": "Писать",           "now": "הוא כותב (Ху котев)"},
+    {"he": "לשמוע",    "tr": "Лишмоа",     "ru": "Слышать",          "now": "אני שומע (Ани шомеа)"},
+    {"he": "להבין",    "tr": "Лехавин",    "ru": "Понимать",         "now": "הוא מבין (Ху мевин)"},
+    {"he": "לחשוב",    "tr": "Лахшов",     "ru": "Думать",           "now": "אני חושב (Ани хошев)"},
+    {"he": "להרגיש",   "tr": "Лехаргиш",  "ru": "Чувствовать",      "now": "היא מרגישה (Хи маргиша)"},
+    {"he": "לזכור",    "tr": "Лизкор",     "ru": "Помнить",          "now": "אני זוכר (Ани зохер)"},
+    {"he": "לשכוח",    "tr": "Лишкоах",    "ru": "Забывать",         "now": "הוא שוכח (Ху шоках)"},
+    {"he": "לנסות",    "tr": "Ленасот",    "ru": "Пробовать",        "now": "אני מנסה (Ани менасе)"},
+    {"he": "לבקש",     "tr": "Левакеш",    "ru": "Просить",          "now": "הוא מבקש (Ху мевакеш)"},
+    {"he": "לענות",    "tr": "Ла'анот",    "ru": "Отвечать",         "now": "אני עונה (Ани оне)"},
+    {"he": "לשאול",    "tr": "Лиш'оль",    "ru": "Спрашивать",       "now": "הוא שואל (Ху шоэль)"},
+    {"he": "לפתוח",    "tr": "Лифтоах",    "ru": "Открывать",        "now": "אני פותח (Ани потеах)"},
+    {"he": "לסגור",    "tr": "Лисгор",     "ru": "Закрывать",        "now": "הוא סוגר (Ху согер)"},
+    {"he": "לצאת",     "tr": "Лацет",      "ru": "Выходить",         "now": "אני יוצא (Ани йоце)"},
+    {"he": "לחזור",    "tr": "Лахзор",     "ru": "Возвращаться",     "now": "הוא חוזר (Ху хозер)"},
+    {"he": "להגיע",    "tr": "Лехагиа",    "ru": "Прибывать",        "now": "הם מגיעים (Хем магиим)"},
+    {"he": "לעזוב",    "tr": "Ла'азов",    "ru": "Покидать",         "now": "אני עוזב (Ани озев)"},
+    {"he": "לשבת",     "tr": "Лашевет",    "ru": "Сидеть",           "now": "הוא יושב (Ху йошев)"},
+    {"he": "לעמוד",    "tr": "Ла'амод",    "ru": "Стоять",           "now": "אני עומד (Ани омед)"},
+    {"he": "לרוץ",     "tr": "Ларуц",      "ru": "Бежать",           "now": "הוא רץ (Ху рац)"},
+    {"he": "לשיר",     "tr": "Лашир",      "ru": "Петь",             "now": "היא שרה (Хи шара)"},
+    {"he": "לרקוד",    "tr": "Лиркод",     "ru": "Танцевать",        "now": "הם רוקדים (Хем рокдим)"},
+    {"he": "להתחיל",   "tr": "Лехатхиль",  "ru": "Начинать",         "now": "אני מתחיל (Ани матхиль)"},
+    {"he": "לסיים",    "tr": "Лесайем",    "ru": "Заканчивать",      "now": "הוא מסיים (Ху месайем)"},
+    {"he": "להמשיך",   "tr": "Лехамших",   "ru": "Продолжать",       "now": "אני ממשיך (Ани мамшиш)"},
+    {"he": "לחכות",    "tr": "Лехако",     "ru": "Ждать",            "now": "הוא מחכה (Ху мехаке)"},
+    {"he": "להתעורר",  "tr": "Лехиторер",  "ru": "Просыпаться",      "now": "אני מתעורר (Ани митъорер)"},
+    {"he": "לאהוב",    "tr": "Леэхов",     "ru": "Любить",           "now": "הוא אוהב (Ху охев)"},
+    {"he": "לשמוח",    "tr": "Лисмоах",    "ru": "Радоваться",       "now": "היא שמחה (Хи смеха)"},
+    {"he": "לפחד",     "tr": "Лифход",     "ru": "Бояться",          "now": "הוא פוחד (Ху пoхед)"},
+    {"he": "לשלם",     "tr": "Лешалем",    "ru": "Платить",          "now": "אני משלם (Ани мешалем)"},
+    {"he": "לקנות",    "tr": "Ликнот",     "ru": "Покупать",         "now": "הוא קונה (Ху коне)"},
+    {"he": "למכור",    "tr": "Лимкор",     "ru": "Продавать",        "now": "הם מוכרים (Хем мохрим)"},
+    {"he": "לבשל",     "tr": "Левашель",   "ru": "Готовить еду",     "now": "היא מבשלת (Хи мевашелет)"},
+    {"he": "לנסוע",    "tr": "Линсоа",     "ru": "Ехать",            "now": "אני נוסע (Ани носеа)"},
+    {"he": "לטוס",     "tr": "Латус",      "ru": "Лететь",           "now": "הוא טס (Ху тас)"},
+    {"he": "לשחות",    "tr": "Лисхот",     "ru": "Плавать",          "now": "אני שוחה (Ани шохе)"},
+    {"he": "לבכות",    "tr": "Ливкот",     "ru": "Плакать",          "now": "הוא בוכה (Ху боке)"},
+    {"he": "לצחוק",    "tr": "Лицхок",     "ru": "Смеяться",         "now": "היא צוחקת (Хи цохекет)"},
+    {"he": "לחשב",     "tr": "Лехашев",    "ru": "Считать/думать",   "now": "אני חושב (Ани хошев)"},
+    {"he": "לגדול",    "tr": "Лигдоль",    "ru": "Расти",            "now": "הוא גדל (Ху гадель)"},
+    {"he": "להחליט",   "tr": "Лехахлит",   "ru": "Решать",           "now": "אני מחליט (Ани махлит)"},
+    {"he": "לבחור",    "tr": "Ливхор",     "ru": "Выбирать",         "now": "הוא בוחר (Ху вохер)"},
+    {"he": "להצליח",   "tr": "Лехацлиах",  "ru": "Преуспевать",      "now": "אני מצליח (Ани мацлиах)"},
+    {"he": "להסתדר",   "tr": "Лехистадер", "ru": "Справляться",      "now": "הוא מסתדר (Ху мистадер)"},
+]
+
+V1_P2_WORDS = [
+    {"he": "עט",         "tr": "Эт",         "ru": "Ручка"},
+    {"he": "מחשב",       "tr": "Махшев",      "ru": "Компьютер"},
+    {"he": "הר",         "tr": "Хар",         "ru": "Гора"},
+    {"he": "ים",         "tr": "Ям",          "ru": "Море"},
+    {"he": "נהר",        "tr": "Нахар",       "ru": "Река"},
+    {"he": "עץ",         "tr": "Эц",          "ru": "Дерево"},
+    {"he": "פרח",        "tr": "Перах",       "ru": "Цветок"},
+    {"he": "שמיים",      "tr": "Шамаим",      "ru": "Небо"},
+    {"he": "גשם",        "tr": "Гешем",       "ru": "Дождь"},
+    {"he": "שלג",        "tr": "Шелег",       "ru": "Снег"},
+    {"he": "רוח",        "tr": "Руах",        "ru": "Ветер"},
+    {"he": "חלום",       "tr": "Халом",       "ru": "Сон / мечта"},
+    {"he": "אמת",        "tr": "Эмет",        "ru": "Правда"},
+    {"he": "חתונה",      "tr": "Хатуна",      "ru": "Свадьба"},
+    {"he": "חג",         "tr": "Хаг",         "ru": "Праздник"},
+    {"he": "שבת",        "tr": "Шабат",       "ru": "Суббота"},
+    {"he": "יום ראשון",  "tr": "Йом ришон",   "ru": "Воскресенье"},
+    {"he": "יום שני",    "tr": "Йом шени",    "ru": "Понедельник"},
+    {"he": "יום שלישי",  "tr": "Йом шлиши",   "ru": "Вторник"},
+    {"he": "יום רביעי",  "tr": "Йом ревии",   "ru": "Среда"},
+    {"he": "יום חמישי",  "tr": "Йон хамиши",  "ru": "Четверг"},
+    {"he": "יום שישי",   "tr": "Йом шиши",    "ru": "Пятница"},
+    {"he": "דקה",        "tr": "Дака",        "ru": "Минута"},
+    {"he": "שנייה",      "tr": "Шния",        "ru": "Секунда"},
+    {"he": "בוקר",       "tr": "Бокер",       "ru": "Утро"},
+    {"he": "צהריים",     "tr": "Цаараим",     "ru": "Полдень"},
+    {"he": "ערב",        "tr": "Эрев",        "ru": "Вечер"},
+    {"he": "שלום",       "tr": "Шалом",       "ru": "Мир"},
+    {"he": "מלחמה",      "tr": "Милхама",     "ru": "Война"},
+    {"he": "חופש",       "tr": "Хофеш",       "ru": "Свобода / каникулы"},
+    {"he": "אהבה",       "tr": "Ахава",       "ru": "Любовь"},
+    {"he": "חכם",        "tr": "Хахам",       "ru": "Умный"},
+    {"he": "טיפש",       "tr": "Типеш",       "ru": "Глупый"},
+    {"he": "חזק",        "tr": "Хазак",       "ru": "Сильный"},
+    {"he": "חלש",        "tr": "Халаш",       "ru": "Слабый"},
+    {"he": "יין",        "tr": "Яин",         "ru": "Вино"},
+    {"he": "בירה",       "tr": "Бира",        "ru": "Пиво"},
+    {"he": "גבינה",      "tr": "Гвина",       "ru": "Сыр"},
+    {"he": "שמן",        "tr": "Шемен",       "ru": "Масло"},
+    {"he": "פלפל",       "tr": "Пильпель",    "ru": "Перец"},
+    {"he": "שכן",        "tr": "Шахен",       "ru": "Сосед"},
+    {"he": "אורח",       "tr": "Ореах",       "ru": "Гость"},
+    {"he": "ידיד",       "tr": "Ядид",        "ru": "Приятель"},
+    {"he": "אויב",       "tr": "Ойев",        "ru": "Враг"},
+    {"he": "עשיר",       "tr": "Ашир",        "ru": "Богатый"},
+    {"he": "עני",        "tr": "Ани",         "ru": "Бедный"},
+    {"he": "אמיץ",       "tr": "Амиц",        "ru": "Смелый"},
+    {"he": "נקי",        "tr": "Наки",        "ru": "Чистый"},
+    {"he": "קשה",        "tr": "Каше",        "ru": "Тяжёлый/трудный"},
+    {"he": "קל",         "tr": "Каль",        "ru": "Лёгкий"},
+    {"he": "ספינה",      "tr": "ספина",       "ru": "Корабль"},
+    {"he": "רכבת",       "tr": "Ракевет",     "ru": "Поезд"},
+    {"he": "אופניים",    "tr": "Офанаим",     "ru": "Велосипед"},
+    {"he": "תרופה",      "tr": "Труфа",       "ru": "Лекарство"},
+    {"he": "רופא",       "tr": "Рофе",        "ru": "Врач"},
+    {"he": "אחות",       "tr": "Ахот",        "ru": "Медсестра / сестра"},
+    {"he": "משטרה",      "tr": "Миштара",     "ru": "Полиция"},
+    {"he": "כבאים",      "tr": "Кабаим",      "ru": "Пожарные"},
+    {"he": "חנות",       "tr": "Ханут",       "ru": "Магазин"},
+    {"he": "שוק",        "tr": "Шук",         "ru": "Рынок"},
+    {"he": "בנק",        "tr": "Банк",        "ru": "Банк"},
+    {"he": "תחנת אוטובוס","tr": "Тахант отобус","ru": "Автобусная остановка"},
+    {"he": "שדה תעופה",  "tr": "Седе теуфа",  "ru": "Аэропорт"},
+    {"he": "מלון",       "tr": "Малон",       "ru": "Гостиница"},
+    {"he": "מסעדה",      "tr": "Мисъада",     "ru": "Ресторан"},
+    {"he": "תפריט",      "tr": "Тафрит",      "ru": "Меню"},
+    {"he": "חשבון",      "tr": "Хешбон",      "ru": "Счёт"},
+    {"he": "כרטיס",      "tr": "Картис",      "ru": "Билет / карта"},
+    {"he": "דרכון",      "tr": "Даркон",      "ru": "Паспорт"},
+    {"he": "כתובת",      "tr": "Ктовет",      "ru": "Адрес"},
+    {"he": "מפה",        "tr": "Мапа",        "ru": "Карта (географ.)"},
+    {"he": "ימין",       "tr": "Ямин",        "ru": "Направо"},
+    {"he": "שמאל",       "tr": "Смоль",       "ru": "Налево"},
+    {"he": "ישר",        "tr": "Яшар",        "ru": "Прямо"},
+    {"he": "קרוב",       "tr": "Каров",       "ru": "Близко"},
+    {"he": "רחוק",       "tr": "Рахок",       "ru": "Далеко"},
+    {"he": "אבא",        "tr": "Аба",         "ru": "Папа"},
+    {"he": "אמא",        "tr": "Има",         "ru": "Мама"},
+    {"he": "אח",         "tr": "Ах",          "ru": "Брат"},
+    {"he": "סבא",        "tr": "Саба",        "ru": "Дедушка"},
+    {"he": "סבתא",       "tr": "Савта",       "ru": "Бабушка"},
+    {"he": "דוד",        "tr": "Дод",         "ru": "Дядя"},
+    {"he": "דודה",       "tr": "Дода",        "ru": "Тётя"},
+    {"he": "בן / בת",    "tr": "Бен / Бат",   "ru": "Сын / Дочь"},
+    {"he": "נכד / נכדה", "tr": "Нехед / Нехда","ru": "Внук / Внучка"},
+    {"he": "חתן / כלה",  "tr": "Хатан / Кала","ru": "Жених / Невеста"},
+    {"he": "ממשלה",      "tr": "Мемшала",     "ru": "Правительство"},
+    {"he": "בחירות",     "tr": "Бхирот",      "ru": "Выборы"},
+    {"he": "חוק",        "tr": "Хок",         "ru": "Закон"},
+    {"he": "גן",         "tr": "Ган",         "ru": "Сад / парк"},
+    {"he": "ים התיכון",  "tr": "Ям ха-Тихон", "ru": "Средиземное море"},
+    {"he": "ירושלים",    "tr": "Ерушалаим",   "ru": "Иерусалим"},
+    {"he": "תל אביב",    "tr": "Тель Авив",   "ru": "Тель-Авив"},
+    {"he": "חיפה",       "tr": "Хейфа",       "ru": "Хайфа"},
+    {"he": "ישראל",      "tr": "Исраэль",     "ru": "Израиль"},
+    {"he": "כחול",       "tr": "Кахоль",      "ru": "Синий"},
+    {"he": "לבן",        "tr": "Лаван",       "ru": "Белый"},
+    {"he": "שחור",       "tr": "Шахор",       "ru": "Чёрный"},
+    {"he": "אדום",       "tr": "Адом",        "ru": "Красный"},
+    {"he": "ירוק",       "tr": "Ярок",        "ru": "Зелёный"},
+    {"he": "צהוב",       "tr": "Цахов",       "ru": "Жёлтый"},
+]
+
+# ─── Часть 3 ─────────────────────────────────────────────────────────────────
+V1_P3_NUMBERS = [
+    {"he": "אלפיים",          "tr": "Альпаим",           "ru": "2000"},
+    {"he": "שלושת אלפים",     "tr": "Шлошет алафим",     "ru": "3000"},
+    {"he": "עשרת אלפים",      "tr": "Асерет алафим",     "ru": "10,000"},
+    {"he": "מאה אלף",         "tr": "Меа элеф",          "ru": "100,000"},
+    {"he": "מיליון",          "tr": "Милйон",            "ru": "1,000,000"},
+    {"he": "עשרה מיליון",     "tr": "Асара милйон",      "ru": "10,000,000"},
+    {"he": "מאה מיליון",      "tr": "Меа милйон",        "ru": "100,000,000"},
+]
+
+V1_P3_VERBS = [
+    {"he": "לצייר",    "tr": "Лецайер",    "ru": "Рисовать",         "now": "אני מצייר (Ани мецайер)"},
+    {"he": "לצלם",     "tr": "Лецалем",    "ru": "Фотографировать",  "now": "הוא מצלם (Ху мецалем)"},
+    {"he": "לשחק",     "tr": "Лесахэк",    "ru": "Играть",           "now": "הם משחקים (Хем месахаким)"},
+    {"he": "לנצח",     "tr": "Ленацеах",   "ru": "Побеждать",        "now": "אני מנצח (Ани менацеах)"},
+    {"he": "לספר",     "tr": "Лесапер",    "ru": "Рассказывать",     "now": "הוא מספר (Ху месапер)"},
+    {"he": "לשמור",    "tr": "Лишмор",     "ru": "Хранить/беречь",   "now": "אני שומר (Ани шомер)"},
+    {"he": "לעזור",    "tr": "Лаазор",     "ru": "Помогать",         "now": "הוא עוזר (Ху озер)"},
+    {"he": "להכיר",    "tr": "Лехакир",    "ru": "Знать (знакомство)","now": "אני מכיר (Ани макир)"},
+    {"he": "להזמין",   "tr": "Лехазмин",   "ru": "Приглашать",       "now": "הוא מזמין (Ху мазмин)"},
+    {"he": "לשפוט",    "tr": "Лишфот",     "ru": "Судить",           "now": "הם שופטים (Хем шофтим)"},
+    {"he": "לסדר",     "tr": "Лесадер",    "ru": "Убирать/устраивать","now": "אני מסדר (Ани месадер)"},
+    {"he": "לנקות",    "tr": "Ленакот",    "ru": "Убирать/чистить",  "now": "היא מנקה (Хи менаке)"},
+    {"he": "לתקן",     "tr": "Летакен",    "ru": "Чинить",           "now": "הוא מתקן (Ху метакен)"},
+    {"he": "לבנות",    "tr": "Ливнот",     "ru": "Строить",          "now": "אני בונה (Ани боне)"},
+    {"he": "לחלק",     "tr": "Лехалек",    "ru": "Делить/раздавать", "now": "הוא מחלק (Ху мехалек)"},
+    {"he": "לחבר",     "tr": "Лехабер",    "ru": "Соединять",        "now": "אני מחבר (Ани мехабер)"},
+    {"he": "לסכם",     "tr": "Лесакем",    "ru": "Резюмировать",     "now": "הוא מסכם (Ху месакем)"},
+    {"he": "להסביר",   "tr": "Лехасбир",   "ru": "Объяснять",        "now": "אני מסביר (Ани масбир)"},
+    {"he": "לחקור",    "tr": "Лахкор",     "ru": "Исследовать",      "now": "הוא חוקר (Ху хокер)"},
+    {"he": "להגיד",    "tr": "Лехагид",    "ru": "Говорить/сказать", "now": "אני אומר (Ани омер)"},
+    {"he": "לבדוק",    "tr": "Ливдок",     "ru": "Проверять",        "now": "הוא בודק (Ху бодек)"},
+    {"he": "לנהל",     "tr": "Лenhagen",   "ru": "Управлять",        "now": "אני מנהל (Ани менахель)"},
+    {"he": "להוביל",   "tr": "Лехоиль",    "ru": "Вести/руководить", "now": "הוא מוביל (Ху мовиль)"},
+    {"he": "להשפיע",   "tr": "Лехашпиа",   "ru": "Влиять",           "now": "הוא משפיע (Ху машпиа)"},
+    {"he": "לקבל",     "tr": "Лекабель",   "ru": "Получать",         "now": "אני מקבל (Ани мекабель)"},
+    {"he": "לשלוח",    "tr": "Лишлоах",    "ru": "Посылать",         "now": "הוא שולח (Ху шолеах)"},
+    {"he": "להכין",    "tr": "Лехахин",    "ru": "Готовить/подготавливать","now": "אני מכין (Ани мехин)"},
+    {"he": "לפתח",     "tr": "Лефатеах",   "ru": "Развивать",        "now": "הוא מפתח (Ху мефатеах)"},
+    {"he": "לשנות",    "tr": "Лешанот",    "ru": "Менять",           "now": "אני משנה (Ани мешане)"},
+    {"he": "להגן",     "tr": "Лехаген",    "ru": "Защищать",         "now": "הוא מגן (Ху меген)"},
+    {"he": "לטפל",     "tr": "Летапель",   "ru": "Заботиться/лечить","now": "אני מטפל (Ани метапель)"},
+    {"he": "להסכים",   "tr": "Лехаским",   "ru": "Соглашаться",       "now": "הוא מסכים (Ху маским)"},
+    {"he": "להתנגד",   "tr": "Лехитнагед", "ru": "Возражать",         "now": "הוא מתנגד (Ху митнагед)"},
+    {"he": "להציע",    "tr": "Лехациа",    "ru": "Предлагать",        "now": "אני מציע (Ани мациа)"},
+    {"he": "לכבד",     "tr": "Лехабед",    "ru": "Уважать",           "now": "אני מכבד (Ани мехабед)"},
+    {"he": "להעריך",   "tr": "Лехаарих",   "ru": "Ценить",            "now": "הוא מעריך (Ху маарих)"},
+    {"he": "לסמוך",    "tr": "Лисмох",     "ru": "Доверять",          "now": "אני סומך (Ани сомех)"},
+    {"he": "לדאוג",    "tr": "Лид'ог",     "ru": "Беспокоиться",      "now": "אני דואג (Ани доэг)"},
+    {"he": "להרגיע",   "tr": "Лехаргиа",   "ru": "Успокаивать",       "now": "הוא מרגיע (Ху маргиа)"},
+    {"he": "להפתיע",   "tr": "Лехафтиа",   "ru": "Удивлять",          "now": "היא מפתיעה (Хи мафтиа)"},
+    {"he": "לשכנע",    "tr": "Лешахнеа",   "ru": "Убеждать",          "now": "אני משכנע (Ани мешахнеа)"},
+    {"he": "להתווכח",  "tr": "Лехитвакеах","ru": "Спорить",           "now": "הם מתווכחים (Хем митвакхим)"},
+    {"he": "לחגוג",    "tr": "Лехагог",    "ru": "Праздновать",       "now": "אנחנו חוגגים (Анахну хогим)"},
+    {"he": "להשתתף",   "tr": "Лехиштатеф", "ru": "Участвовать",       "now": "אני משתתף (Ани миштатеф)"},
+    {"he": "לתמוך",    "tr": "Литмох",     "ru": "Поддерживать",      "now": "הוא תומך (Ху томех)"},
+    {"he": "להתקדם",   "tr": "Лехиткадем", "ru": "Продвигаться",      "now": "אני מתקדם (Ани миткадем)"},
+    {"he": "להשיג",    "tr": "Лехасиг",    "ru": "Достигать",         "now": "הוא משיג (Ху масиг)"},
+    {"he": "לוותר",    "tr": "Леватер",    "ru": "Уступать/отказываться","now": "אני מוותר (Ани меватер)"},
+    {"he": "לחדש",     "tr": "Лехадеш",    "ru": "Обновлять",         "now": "אני מחדש (Ани мехадеш)"},
+    {"he": "להעביר",   "tr": "Лехаавир",   "ru": "Передавать",        "now": "הוא מעביר (Ху маавир)"},
+    {"he": "לאחד",     "tr": "Леахед",     "ru": "Объединять",        "now": "אנחנו מאחדים (Анахну меахдим)"},
+    {"he": "לשתף",     "tr": "Лешатеф",    "ru": "Делиться",          "now": "אני משתף (Ани мешатеф)"},
+    {"he": "להגביל",   "tr": "Лехагбиль",  "ru": "Ограничивать",      "now": "הוא מגביל (Ху магбиль)"},
+    {"he": "לאפשר",    "tr": "Лефашер",    "ru": "Разрешать/позволять","now": "זה מאפשר (Зе мефашер)"},
+    {"he": "לממן",     "tr": "Лемамен",    "ru": "Финансировать",     "now": "הוא ממן (Ху мемамен)"},
+    {"he": "לפתור",    "tr": "Лифтор",     "ru": "Решать (проблему)", "now": "אני פותר (Ани потер)"},
+    {"he": "לגרום",    "tr": "Лигром",     "ru": "Вызывать/причинять","now": "זה גורם (Зе горем)"},
+    {"he": "להוכיח",   "tr": "Лехохиах",   "ru": "Доказывать",        "now": "הוא מוכיח (Ху мохиах)"},
+    {"he": "להתאים",   "tr": "Лехитаем",   "ru": "Подходить/соответствовать","now": "זה מתאים (Зе митаем)"},
+]
+
+V1_P3_WORDS = [
+    {"he": "אקלים",      "tr": "Аклим",       "ru": "Климат"},
+    {"he": "סביבה",      "tr": "Свива",       "ru": "Окружающая среда"},
+    {"he": "אנרגיה",     "tr": "Энергия",     "ru": "Энергия"},
+    {"he": "טכנולוגיה",  "tr": "Технология",  "ru": "Технология"},
+    {"he": "מדע",        "tr": "Мада",        "ru": "Наука"},
+    {"he": "אמנות",      "tr": "Оманут",      "ru": "Искусство"},
+    {"he": "מוזיקה",     "tr": "Музика",      "ru": "Музыка"},
+    {"he": "ספורט",      "tr": "Спорт",       "ru": "Спорт"},
+    {"he": "כדורגל",     "tr": "Кадурегель",  "ru": "Футбол"},
+    {"he": "כדורסל",     "tr": "Кадурсаль",   "ru": "Баскетбол"},
+    {"he": "שחייה",      "tr": "Схийя",       "ru": "Плавание"},
+    {"he": "בריאות",     "tr": "Бриют",       "ru": "Здоровье"},
+    {"he": "מחלה",       "tr": "Махала",      "ru": "Болезнь"},
+    {"he": "כאב",        "tr": "Кеэв",        "ru": "Боль"},
+    {"he": "חום",        "tr": "Хом",         "ru": "Температура (жар)"},
+    {"he": "השכלה",      "tr": "Хаскала",     "ru": "Образование"},
+    {"he": "אוניברסיטה", "tr": "Университа",  "ru": "Университет"},
+    {"he": "מקצוע",      "tr": "Миксоэ",      "ru": "Профессия"},
+    {"he": "הנדסה",      "tr": "Хандаса",     "ru": "Инженерия"},
+    {"he": "רפואה",      "tr": "Рефуа",       "ru": "Медицина"},
+    {"he": "משפטים",     "tr": "Мишпатим",    "ru": "Право / законы"},
+    {"he": "כלכלה",      "tr": "Калкала",     "ru": "Экономика"},
+    {"he": "פוליטיקה",   "tr": "Политика",    "ru": "Политика"},
+    {"he": "היסטוריה",   "tr": "Хистория",    "ru": "История"},
+    {"he": "גיאוגרפיה",  "tr": "География",   "ru": "География"},
+    {"he": "פילוסופיה",  "tr": "Философия",   "ru": "Философия"},
+    {"he": "פסיכולוגיה", "tr": "Психология",  "ru": "Психология"},
+    {"he": "ביולוגיה",   "tr": "Биология",    "ru": "Биология"},
+    {"he": "כימיה",      "tr": "Химия",       "ru": "Химия"},
+    {"he": "פיזיקה",     "tr": "Физика",      "ru": "Физика"},
+    {"he": "מתמטיקה",    "tr": "Математика",  "ru": "Математика"},
+    {"he": "סטטיסטיקה",  "tr": "Статистика",  "ru": "Статистика"},
+    {"he": "אלגוריתם",   "tr": "Алгоритм",    "ru": "Алгоритм"},
+    {"he": "תוכנה",      "tr": "Токhна",      "ru": "Программное обеспечение"},
+    {"he": "חומרה",      "tr": "Хомера",      "ru": "Аппаратное обеспечение"},
+    {"he": "רשת",        "tr": "Решет",       "ru": "Сеть"},
+    {"he": "אינטרנט",    "tr": "Интернет",    "ru": "Интернет"},
+    {"he": "אפליקציה",   "tr": "Аппликация",  "ru": "Приложение"},
+    {"he": "מסך",        "tr": "Масах",       "ru": "Экран"},
+    {"he": "מקלדת",      "tr": "Микледет",    "ru": "Клавиатура"},
+    {"he": "עכבר",       "tr": "Ахбар",       "ru": "Мышь (компьютер)"},
+    {"he": "שרת",        "tr": "Шерет",       "ru": "Сервер"},
+    {"he": "קובץ",       "tr": "Кoвец",       "ru": "Файл"},
+    {"he": "תיקייה",     "tr": "Тикийя",      "ru": "Папка"},
+    {"he": "סיסמה",      "tr": "Сисма",       "ru": "Пароль"},
+    {"he": "חשבון",      "tr": "Хешбон",      "ru": "Аккаунт/счёт"},
+    {"he": "הודעה",      "tr": "Ходаа",       "ru": "Сообщение"},
+    {"he": "שיחה",       "tr": "Сиха",        "ru": "Разговор/звонок"},
+    {"he": "פגישה",      "tr": "Пгиша",       "ru": "Встреча"},
+    {"he": "לוח שנה",    "tr": "Луах шана",   "ru": "Календарь"},
+    {"he": "תזכורת",     "tr": "Тзкорет",     "ru": "Напоминание"},
+    {"he": "דוח",        "tr": "Дох",         "ru": "Отчёт"},
+    {"he": "תקציב",      "tr": "Такциб",      "ru": "Бюджет"},
+    {"he": "רווח",       "tr": "Реваx",       "ru": "Прибыль"},
+    {"he": "הפסד",       "tr": "Хефсед",      "ru": "Убыток"},
+    {"he": "השקעה",      "tr": "Хашкаа",      "ru": "Инвестиция"},
+    {"he": "ביטוח",      "tr": "Битуах",      "ru": "Страхование"},
+    {"he": "מס",         "tr": "Мас",         "ru": "Налог"},
+    {"he": "חוזה",       "tr": "Хозе",        "ru": "Договор/контракт"},
+    {"he": "עסק",        "tr": "Эсек",        "ru": "Бизнес/дело"},
+    {"he": "שותף",       "tr": "Шутаф",       "ru": "Партнёр"},
+    {"he": "לקוח",       "tr": "Лакоах",      "ru": "Клиент"},
+    {"he": "ספק",        "tr": "Сафак",       "ru": "Поставщик"},
+    {"he": "תחרות",      "tr": "Тахарут",     "ru": "Конкуренция"},
+    {"he": "שוק",        "tr": "Шук",         "ru": "Рынок"},
+    {"he": "מוצר",       "tr": "Муцар",       "ru": "Продукт/товар"},
+    {"he": "שירות",      "tr": "Шерут",       "ru": "Услуга"},
+    {"he": "איכות",      "tr": "Эйхут",       "ru": "Качество"},
+    {"he": "כמות",       "tr": "Камут",       "ru": "Количество"},
+    {"he": "מחיר",       "tr": "Мехир",       "ru": "Цена"},
+    {"he": "הנחה",       "tr": "Ханаха",      "ru": "Скидка"},
+    {"he": "מבצע",       "tr": "Мивца",       "ru": "Акция/операция"},
+    {"he": "פרסום",      "tr": "Пирсум",      "ru": "Реклама/публикация"},
+    {"he": "מותג",       "tr": "Мутаг",       "ru": "Бренд"},
+    {"he": "תדמית",      "tr": "Тадмит",      "ru": "Имидж"},
+    {"he": "הצלחה",      "tr": "Хацлаха",     "ru": "Успех"},
+    {"he": "כישלון",     "tr": "Кишалон",     "ru": "Провал/неудача"},
+    {"he": "ניסיון",     "tr": "Нисайон",     "ru": "Опыт/попытка"},
+    {"he": "כישרון",     "tr": "Кишарон",     "ru": "Талант"},
+    {"he": "יצירתיות",   "tr": "Ецирантиют",  "ru": "Творчество"},
+    {"he": "חדשנות",     "tr": "Хадшанут",    "ru": "Инновация"},
+    {"he": "שינוי",      "tr": "Шинуй",       "ru": "Изменение"},
+    {"he": "התפתחות",    "tr": "Хитпатхут",   "ru": "Развитие"},
+    {"he": "עתיד",       "tr": "Атид",        "ru": "Будущее"},
+    {"he": "עבר",        "tr": "Авар",        "ru": "Прошлое"},
+    {"he": "הווה",       "tr": "Хове",        "ru": "Настоящее"},
+    {"he": "מטרה",       "tr": "Матара",      "ru": "Цель"},
+    {"he": "תוכנית",     "tr": "Токhnит",     "ru": "План"},
+    {"he": "אסטרטגיה",   "tr": "Астратегия",  "ru": "Стратегия"},
+    {"he": "פתרון",      "tr": "Питрон",      "ru": "Решение"},
+    {"he": "אתגר",       "tr": "Этгар",       "ru": "Вызов/задача"},
+    {"he": "הזדמנות",    "tr": "Хиздамнут",   "ru": "Возможность"},
+    {"he": "סיכון",      "tr": "Сикун",       "ru": "Риск"},
+    {"he": "ביטחון",     "tr": "Битахон",     "ru": "Безопасность/уверенность"},
+    {"he": "שלום",       "tr": "Шалом",       "ru": "Мир (отсутствие войны)"},
+    {"he": "דמוקרטיה",   "tr": "Демократия",  "ru": "Демократия"},
+    {"he": "חברה",       "tr": "Хевра",       "ru": "Общество/компания"},
+    {"he": "תרבות",      "tr": "Тарбут",      "ru": "Культура"},
+    {"he": "מסורת",      "tr": "Масорет",     "ru": "Традиция"},
+    {"he": "דת",         "tr": "Дат",         "ru": "Религия"},
+    {"he": "אמונה",      "tr": "Эмуна",       "ru": "Вера"},
+    {"he": "ערכים",      "tr": "Эрахим",      "ru": "Ценности"},
+    {"he": "מוסר",       "tr": "Мусар",       "ru": "Мораль/нравственность"},
+    {"he": "צדק",        "tr": "Цедек",       "ru": "Справедливость"},
+    {"he": "חופש",       "tr": "Хофеш",       "ru": "Свобода"},
+    {"he": "שוויון",     "tr": "Шивьон",      "ru": "Равенство"},
+    {"he": "זכויות",     "tr": "Зхуйот",      "ru": "Права"},
+    {"he": "אחריות",     "tr": "Ахраюут",     "ru": "Ответственность"},
+    {"he": "כבוד",       "tr": "Кавод",       "ru": "Уважение/честь"},
+    {"he": "בושה",       "tr": "Буша",        "ru": "Стыд"},
+    {"he": "גאווה",      "tr": "Гаава",       "ru": "Гордость"},
+    {"he": "ענווה",      "tr": "Анава",       "ru": "Скромность"},
+    {"he": "סבלנות",     "tr": "Савланут",    "ru": "Терпение"},
+    {"he": "אומץ",       "tr": "Omец",        "ru": "Смелость"},
+]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ДАННЫЕ — ВАРИАНТ 2 (глаголы в трёх временах)
+#  Используем те же слова, числа, приветствия, но глаголы расширены
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def make_v2_verb(he, tr, ru, now, past, future):
+    return {"he": he, "tr": tr, "ru": ru, "now": now, "past": past, "future": future}
+
+V2_P1_VERBS = [
+    make_v2_verb("להיות",  "Лихйот",  "Быть",
+        "הוא הוא (Ху ху) — Он есть",
+        "הייתי (Айти) — Я был",
+        "אהיה (Эхье) — Я буду"),
+    make_v2_verb("לעשות",  "Лаасот",  "Делать",
+        "אני עושה (Ани осе) — Я делаю",
+        "עשיתי (Асити) — Я сделал",
+        "אעשה (Эасе) — Я сделаю"),
+    make_v2_verb("לומר",   "Ломар",   "Говорить/сказать",
+        "הוא אומר (Ху омер) — Он говорит",
+        "אמרתי (Амарти) — Я сказал",
+        "אומר (Омар) — Я скажу"),
+    make_v2_verb("ללכת",   "Лалехет", "Идти/ходить",
+        "אני הולך (Ани холех) — Я иду",
+        "הלכתי (Халахти) — Я шёл",
+        "אלך (Элех) — Я пойду"),
+    make_v2_verb("לדעת",   "Лада'ат", "Знать",
+        "אני יודע (Ани йодеа) — Я знаю",
+        "ידעתי (Ядати) — Я знал",
+        "אדע (Эда) — Я буду знать"),
+    make_v2_verb("לראות",  "Лиръот",  "Видеть",
+        "הוא רואה (Ху роэ) — Он видит",
+        "ראיתי (Раити) — Я видел",
+        "אראה (Эра) — Я увижу"),
+    make_v2_verb("לבוא",   "Лаво",    "Приходить",
+        "היא באה (Хи баа) — Она приходит",
+        "באתי (Бати) — Я пришёл",
+        "אבוא (Аво) — Я приду"),
+    make_v2_verb("לתת",    "Латет",   "Давать",
+        "אני נותן (Ани нотен) — Я даю",
+        "נתתי (Натати) — Я дал",
+        "אתן (Этен) — Я дам"),
+    make_v2_verb("לדבר",   "Ледабер", "Разговаривать",
+        "הם מדברים (Хем медабрим) — Они говорят",
+        "דברתי (Диберти) — Я говорил",
+        "אדבר (Адабер) — Я буду говорить"),
+    make_v2_verb("לרצות",  "Лирцот",  "Хотеть",
+        "אני רוצה (Ани роце) — Я хочу",
+        "רציתי (Рацити) — Я хотел",
+        "ארצה (Эрце) — Я захочу"),
+]
+
+V2_P2_VERBS = [
+    make_v2_verb("לאכול",  "Леэхоль",  "Есть/кушать",
+        "אני אוכל (Ани охель)", "אכלתי (Ахальти) — Я ел", "אוכל (Оkhель) — Я поем"),
+    make_v2_verb("לשתות",  "Лиштот",   "Пить",
+        "הוא שותה (Ху шоте)", "שתיתי (Штити) — Я пил", "אשתה (Эште) — Я выпью"),
+    make_v2_verb("לישון",  "Лишон",    "Спать",
+        "היא ישנה (Хи яшена)", "ישנתי (Яшанти) — Я спал", "אישן (Эйшан) — Я засну"),
+    make_v2_verb("לעבוד",  "Ла'авод",  "Работать",
+        "אני עובד (Ани овед)", "עבדתי (Авадти) — Я работал", "אעבוד (Э'авод) — Я буду работать"),
+    make_v2_verb("ללמוד",  "Лилмод",   "Учиться",
+        "הם לומדים (Хем ломдим)", "למדתי (Ламадти) — Я учился", "אלמד (Элмад) — Я буду учиться"),
+    make_v2_verb("לקרוא",  "Ликро",    "Читать",
+        "אני קורא (Ани коре)", "קראתי (Карати) — Я читал", "אקרא (Экра) — Я прочитаю"),
+    make_v2_verb("לכתוב",  "Лихтов",   "Писать",
+        "הוא כותב (Ху котев)", "כתבתי (Катавти) — Я писал", "אכתוב (Эхтов) — Я напишу"),
+    make_v2_verb("לשמוע",  "Лишмоа",   "Слышать",
+        "אני שומע (Ани шомеа)", "שמעתי (Шамати) — Я слышал", "אשמע (Эшма) — Я услышу"),
+    make_v2_verb("להבין",  "Лехавин",  "Понимать",
+        "הוא מבין (Ху мевин)", "הבנתי (Эванти) — Я понял", "אבין (Авин) — Я пойму"),
+    make_v2_verb("לחשוב",  "Лахшов",   "Думать",
+        "אני חושב (Ани хошев)", "חשבתי (Хашавти) — Я думал", "אחשוב (Эхшов) — Я подумаю"),
+    make_v2_verb("לזכור",  "Лизкор",   "Помнить",
+        "אני זוכר (Ани зохер)", "זכרתי (Захарти) — Я помнил", "אזכור (Эзкор) — Я запомню"),
+    make_v2_verb("לשכוח",  "Лишкоах",  "Забывать",
+        "הוא שוכח (Ху шоках)", "שכחתי (Шахахти) — Я забыл", "אשכח (Эшках) — Я забуду"),
+    make_v2_verb("לנסות",  "Ленасот",  "Пробовать",
+        "אני מנסה (Ани менасе)", "ניסיתי (Нисити) — Я пробовал", "אנסה (Энасе) — Я попробую"),
+    make_v2_verb("לבקש",   "Левакеш",  "Просить",
+        "הוא מבקש (Ху мевакеш)", "ביקשתי (Бикашти) — Я просил", "אבקש (Эвакеш) — Я попрошу"),
+    make_v2_verb("לענות",  "Ла'анот",  "Отвечать",
+        "אני עונה (Ани оне)", "עניתי (Аниити) — Я отвечал", "אענה (Э'эне) — Я отвечу"),
+    make_v2_verb("לשאול",  "Лиш'оль",  "Спрашивать",
+        "הוא שואל (Ху шоэль)", "שאלתי (Шаальти) — Я спрашивал", "אשאל (Эшаль) — Я спрошу"),
+    make_v2_verb("לפתוח",  "Лифтоах",  "Открывать",
+        "אני פותח (Ани потеах)", "פתחתי (Патахти) — Я открыл", "אפתח (Эфтах) — Я открою"),
+    make_v2_verb("לסגור",  "Лисгор",   "Закрывать",
+        "הוא סוגר (Ху согер)", "סגרתי (Сагарти) — Я закрыл", "אסגור (Эсгор) — Я закрою"),
+    make_v2_verb("לצאת",   "Лацет",    "Выходить",
+        "אני יוצא (Ани йоце)", "יצאתי (Яцати) — Я вышел", "אצא (Эце) — Я выйду"),
+    make_v2_verb("לחזור",  "Лахзор",   "Возвращаться",
+        "הוא חוזר (Ху хозер)", "חזרתי (Хазарти) — Я вернулся", "אחזור (Эхзор) — Я вернусь"),
+    make_v2_verb("להגיע",  "Лехагиа",  "Прибывать",
+        "הם מגיעים (Хем магиим)", "הגעתי (Хигати) — Я прибыл", "אגיע (Агиа) — Я прибуду"),
+    make_v2_verb("לעזוב",  "Ла'азов",  "Покидать",
+        "אני עוזב (Ани озев)", "עזבתי (Азавти) — Я покинул", "אעזוב (Э'эзов) — Я покину"),
+    make_v2_verb("לשבת",   "Лашевет",  "Сидеть",
+        "הוא יושב (Ху йошев)", "ישבתי (Яшавти) — Я сидел", "אשב (Эшев) — Я сяду"),
+    make_v2_verb("לעמוד",  "Ла'амод",  "Стоять",
+        "אני עומד (Ани омед)", "עמדתי (Амадти) — Я стоял", "אעמוד (Э'амод) — Я буду стоять"),
+    make_v2_verb("לרוץ",   "Ларуц",    "Бежать",
+        "הוא רץ (Ху рац)", "רצתי (Рацти) — Я бежал", "ארוץ (Эруц) — Я побегу"),
+    make_v2_verb("לשיר",   "Лашир",    "Петь",
+        "היא שרה (Хи шара)", "שרתי (Шарти) — Я пел", "אשיר (Эшир) — Я спою"),
+    make_v2_verb("לאהוב",  "Леэхов",   "Любить",
+        "הוא אוהב (Ху охев)", "אהבתי (Ахавти) — Я любил", "אאהב (Эхав) — Я буду любить"),
+    make_v2_verb("לשלם",   "Лешалем",  "Платить",
+        "אני משלם (Ани мешалем)", "שילמתי (Шилемти) — Я платил", "אשלם (Эшалем) — Я заплачу"),
+    make_v2_verb("לקנות",  "Ликнот",   "Покупать",
+        "הוא קונה (Ху коне)", "קניתי (Канити) — Я купил", "אקנה (Экне) — Я куплю"),
+    make_v2_verb("לבשל",   "Левашель", "Готовить еду",
+        "היא מבשלת (Хи мевашелет)", "בישלתי (Бишальти) — Я готовил", "אבשל (Эвашель) — Я приготовлю"),
+    make_v2_verb("לנסוע",  "Линсоа",   "Ехать",
+        "אני נוסע (Ани носеа)", "נסעתי (Насаъти) — Я ехал", "אסע (Эса) — Я поеду"),
+    make_v2_verb("לטוס",   "Латус",    "Лететь",
+        "הוא טס (Ху тас)", "טסתי (Тасти) — Я летел", "אטוס (Этос) — Я полечу"),
+    make_v2_verb("לבכות",  "Ливкот",   "Плакать",
+        "הוא בוכה (Ху боке)", "בכיתי (Бахити) — Я плакал", "אבכה (Эвке) — Я заплачу"),
+    make_v2_verb("לצחוק",  "Лицхок",   "Смеяться",
+        "היא צוחקת (Хи цохекет)", "צחקתי (Цахакти) — Я смеялся", "אצחק (Эцхак) — Я засмеюсь"),
+    make_v2_verb("לגדול",  "Лигдоль",  "Расти",
+        "הוא גדל (Ху гадель)", "גדלתי (Гадальти) — Я рос", "אגדל (Эгдаль) — Я вырасту"),
+    make_v2_verb("להחליט", "Лехахлит", "Решать",
+        "אני מחליט (Ани махлит)", "החלטתי (Эхальти) — Я решил", "אחליט (Ахлит) — Я решу"),
+    make_v2_verb("לבחור",  "Ливхор",   "Выбирать",
+        "הוא בוחר (Ху вохер)", "בחרתי (Бахарти) — Я выбрал", "אבחר (Эвхар) — Я выберу"),
+    make_v2_verb("להצליח", "Лехацлиах","Преуспевать",
+        "אני מצליח (Ани мацлиах)", "הצלחתי (Эцлахти) — Я преуспел", "אצליח (Ацлиах) — Я преуспею"),
+    make_v2_verb("לעזור",  "Лаазор",   "Помогать",
+        "הוא עוזר (Ху озер)", "עזרתי (Азарти) — Я помогал", "אעזור (Э'азор) — Я помогу"),
+    make_v2_verb("לשלוח",  "Лишлоах",  "Посылать",
+        "הוא שולח (Ху шолеах)", "שלחתי (Шалахти) — Я послал", "אשלח (Эшлах) — Я пошлю"),
+    make_v2_verb("לקבל",   "Лекабель", "Получать",
+        "אני מקבל (Ани мекабель)", "קיבלתי (Кибальти) — Я получил", "אקבל (Экабель) — Я получу"),
+    make_v2_verb("להסביר", "Лехасбир", "Объяснять",
+        "אני מסביר (Ани масбир)", "הסברתי (Хисбарти) — Я объяснял", "אסביר (Асбир) — Я объясню"),
+    make_v2_verb("להכין",  "Лехахин",  "Готовить/подготавливать",
+        "אני מכין (Ани мехин)", "הכנתי (Эхинти) — Я подготовил", "אכין (Ахин) — Я подготовлю"),
+    make_v2_verb("לשנות",  "Лешанот",  "Менять",
+        "אני משנה (Ани мешане)", "שיניתי (Шиниити) — Я менял", "אשנה (Эшане) — Я изменю"),
+    make_v2_verb("לפתח",   "Лефатеах", "Развивать",
+        "הוא מפתח (Ху мефатеах)", "פיתחתי (Питахти) — Я развивал", "אפתח (Эфатеах) — Я разовью"),
+    make_v2_verb("לנהל",   "Лenhagen", "Управлять",
+        "אני מנהל (Ани менахель)", "ניהלתי (Нихальти) — Я управлял", "אנהל (Анахель) — Я буду управлять"),
+    make_v2_verb("להגן",   "Лехаген",  "Защищать",
+        "הוא מגן (Ху меген)", "הגנתי (Эгенти) — Я защищал", "אגן (Аген) — Я защищу"),
+    make_v2_verb("לספר",   "Лесапер",  "Рассказывать",
+        "הוא מספר (Ху месапер)", "סיפרתי (Сипарти) — Я рассказывал", "אספר (Эсапер) — Я расскажу"),
+    make_v2_verb("לחשב",   "Лехашев",  "Считать/вычислять",
+        "אני חושב (Ани хошев)", "חישבתי (Хишавти) — Я вычислял", "אחשב (Эхашев) — Я вычислю"),
+    make_v2_verb("לתכנן",  "Летахнен", "Планировать",
+        "אני מתכנן (Ани митканен)", "תכננתי (Тикнанти) — Я планировал", "אתכנן (Этакнен) — Я запланирую"),
+]
+
+V2_P3_VERBS = [
+    make_v2_verb("לצייר",   "Лецайер",  "Рисовать",
+        "אני מצייר (Ани мецайер)", "ציירתי (Цийерти) — Я рисовал", "אצייר (Эцайер) — Я нарисую"),
+    make_v2_verb("לצלם",    "Лецалем",  "Фотографировать",
+        "הוא מצלם (Ху мецалем)", "צילמתי (Цилемти) — Я снимал", "אצלם (Эцалем) — Я сниму"),
+    make_v2_verb("לשחק",    "Лесахэк",  "Играть",
+        "הם משחקים (Хем месахаким)", "שיחקתי (Сихакти) — Я играл", "אשחק (Эсахек) — Я сыграю"),
+    make_v2_verb("לנצח",    "Ленацеах", "Побеждать",
+        "אני מנצח (Ани менацеах)", "ניצחתי (Ницахти) — Я победил", "אנצח (Энацеах) — Я победю"),
+    make_v2_verb("לשמור",   "Лишмор",   "Хранить/беречь",
+        "אני שומר (Ани шомер)", "שמרתי (Шамарти) — Я хранил", "אשמור (Эшмор) — Я сохраню"),
+    make_v2_verb("להכיר",   "Лехакир",  "Знать (быть знакомым)",
+        "אני מכיר (Ани макир)", "הכרתי (Хикарти) — Я был знаком", "אכיר (Акир) — Я познакомлюсь"),
+    make_v2_verb("להזמין",  "Лехазмин", "Приглашать/заказывать",
+        "הוא מזמין (Ху мазмин)", "הזמנתי (Хизманти) — Я приглашал", "אזמין (Азмин) — Я приглашу"),
+    make_v2_verb("לסדר",    "Лесадер",  "Убирать/устраивать",
+        "אני מסדר (Ани месадер)", "סידרתי (Сидарти) — Я убирал", "אסדר (Эсадер) — Я уберу"),
+    make_v2_verb("לנקות",   "Ленакот",  "Чистить",
+        "היא מנקה (Хи менаке)", "ניקיתי (Никиити) — Я чистил", "אנקה (Энаке) — Я почищу"),
+    make_v2_verb("לתקן",    "Летакен",  "Чинить",
+        "הוא מתקן (Ху метакен)", "תיקנתי (Тиканти) — Я чинил", "אתקן (Этакен) — Я починю"),
+    make_v2_verb("לבנות",   "Ливнот",   "Строить",
+        "אני בונה (Ани боне)", "בניתי (Банити) — Я строил", "אבנה (Эвне) — Я построю"),
+    make_v2_verb("להשפיע",  "Лехашпиа", "Влиять",
+        "הוא משפיע (Ху машпиа)", "השפעתי (Эшпати) — Я влиял", "אשפיע (Ашпиа) — Я повлияю"),
+    make_v2_verb("לחקור",   "Лахкор",   "Исследовать",
+        "הוא חוקר (Ху хокер)", "חקרתי (Хакарти) — Я исследовал", "אחקור (Эхкор) — Я исследую"),
+    make_v2_verb("לבדוק",   "Ливдок",   "Проверять",
+        "הוא בודק (Ху бодек)", "בדקתי (Бадакти) — Я проверял", "אבדוק (Эвдок) — Я проверю"),
+    make_v2_verb("להוביל",  "Лехоиль",  "Вести/руководить",
+        "הוא מוביל (Ху мовиль)", "הובלתי (Ховальти) — Я вёл", "אוביל (Овиль) — Я поведу"),
+    make_v2_verb("לסכם",    "Лесакем",  "Резюмировать",
+        "הוא מסכם (Ху месакем)", "סיכמתי (Сикамти) — Я резюмировал", "אסכם (Эсакем) — Я резюмирую"),
+    make_v2_verb("לחלק",    "Лехалек",  "Делить/раздавать",
+        "הוא מחלק (Ху мехалек)", "חילקתי (Хилакти) — Я делил", "אחלק (Эхалек) — Я разделю"),
+    make_v2_verb("לחבר",    "Лехабер",  "Соединять",
+        "אני מחבר (Ани мехабер)", "חיברתי (Хиберти) — Я соединял", "אחבר (Эхабер) — Я соединю"),
+    make_v2_verb("להגיד",   "Лехагид",  "Говорить/сказать",
+        "אני אומר (Ани омер)", "אמרתי (Амарти) — Я сказал", "אגיד (Агид) — Я скажу"),
+    make_v2_verb("לשפוט",   "Лишфот",   "Судить",
+        "הם שופטים (Хем шофтим)", "שפטתי (Шафатти) — Я судил", "אשפוט (Эшфот) — Я осужу"),
+    make_v2_verb("לטפל",    "Летапель",  "Заботиться/лечить",
+        "אני מטפל (Ани метапель)", "טיפלתי (Типальти) — Я заботился", "אטפל (Этапель) — Я позабочусь"),
+    make_v2_verb("להסכים",  "Лехаским",  "Соглашаться",
+        "הוא מסכים (Ху маским)", "הסכמתי (Хискамти) — Я согласился", "אסכים (Аским) — Я соглашусь"),
+    make_v2_verb("להתנגד",  "Лехитнагед","Возражать/противиться",
+        "הוא מתנגד (Ху митнагед)", "התנגדתי (Хитнагадти) — Я возражал", "אתנגד (Этнагед) — Я возражу"),
+    make_v2_verb("להציע",   "Лехациа",   "Предлагать",
+        "אני מציע (Ани мациа)", "הצעתי (Хицати) — Я предложил", "אציע (Ациа) — Я предложу"),
+    make_v2_verb("לדחות",   "Лидхот",    "Отклонять/откладывать",
+        "הוא דוחה (Ху дохе)", "דחיתי (Дахити) — Я отклонил", "אדחה (Эдхе) — Я отклоню"),
+    make_v2_verb("להצביע",  "Лехацбиа",  "Голосовать/указывать",
+        "אני מצביע (Ани мацбиа)", "הצבעתי (Хицбати) — Я голосовал", "אצביע (Ацбиа) — Я проголосую"),
+    make_v2_verb("לכבד",    "Лехабед",   "Уважать",
+        "אני מכבד (Ани мехабед)", "כיבדתי (Кибадти) — Я уважал", "אכבד (Эхабед) — Я буду уважать"),
+    make_v2_verb("להעריך",  "Лехаарих",  "Ценить/уважать",
+        "הוא מעריך (Ху маарих)", "העריכתי (Хеерихти) — Я ценил", "אעריך (Аарих) — Я оценю"),
+    make_v2_verb("לסמוך",   "Лисмох",    "Доверять/полагаться",
+        "אני סומך (Ани сомех)", "סמכתי (Самахти) — Я доверял", "אסמוך (Эсмох) — Я буду доверять"),
+    make_v2_verb("להתמודד", "Лехитмодед","Справляться/бороться",
+        "הוא מתמודד (Ху митмодед)", "התמודדתי (Хитмодадти) — Я справлялся", "אתמודד (Этмодед) — Я справлюсь"),
+    make_v2_verb("לדאוג",   "Лид'ог",    "Беспокоиться/заботиться",
+        "אני דואג (Ани доэг)", "דאגתי (Даагти) — Я беспокоился", "אדאג (Эд'аг) — Я позабочусь"),
+    make_v2_verb("להרגיע",  "Лехаргиа",  "Успокаивать",
+        "הוא מרגיע (Ху маргиа)", "הרגעתי (Хиргати) — Я успокаивал", "אַרגיע (Аргиа) — Я успокою"),
+    make_v2_verb("להפתיע",  "Лехафтиа",  "Удивлять",
+        "היא מפתיעה (Хи мафтиа)", "הפתעתי (Хифтати) — Я удивил", "אפתיע (Афтиа) — Я удивлю"),
+    make_v2_verb("לשכנע",   "Лешахнеа",  "Убеждать",
+        "אני משכנע (Ани мешахнеа)", "שכנעתי (Шихнати) — Я убедил", "אשכנע (Эшахнеа) — Я убежу"),
+    make_v2_verb("להתווכח", "Лехитвакеах","Спорить",
+        "הם מתווכחים (Хем митвакхим)", "התווכחתי (Хитвакахти) — Я спорил", "אתווכח (Этвакеах) — Я поспорю"),
+    make_v2_verb("לחגוג",   "Лехагог",   "Праздновать",
+        "אנחנו חוגגים (Анахну хогим)", "חגגתי (Хагагти) — Я праздновал", "אחגוג (Эхгог) — Я отпраздную"),
+    make_v2_verb("להשתתף",  "Лехиштатеф","Участвовать",
+        "אני משתתף (Ани миштатеф)", "השתתפתי (Хиштатафти) — Я участвовал", "אשתתף (Эштатеф) — Я буду участвовать"),
+    make_v2_verb("לתמוך",   "Литмох",    "Поддерживать",
+        "הוא תומך (Ху томех)", "תמכתי (Тамахти) — Я поддерживал", "אתמוך (Этмох) — Я поддержу"),
+    make_v2_verb("להתקדם",  "Лехиткадем","Продвигаться/прогрессировать",
+        "אני מתקדם (Ани миткадем)", "התקדמתי (Хиткадамти) — Я продвигался", "אתקדם (Эткадем) — Я продвинусь"),
+    make_v2_verb("להשיג",   "Лехасиг",   "Достигать/добиваться",
+        "הוא משיג (Ху масиг)", "השגתי (Хисагти) — Я достиг", "אשיג (Асиг) — Я достигну"),
+    make_v2_verb("לוותר",   "Леватер",   "Уступать/отказываться",
+        "אני מוותר (Ани меватер)", "ויתרתי (Витарти) — Я уступил", "אוותר (Эватер) — Я уступлю"),
+    make_v2_verb("להסתפק",  "Лехистапек","Довольствоваться",
+        "הוא מסתפק (Ху мистапек)", "הסתפקתי (Хистапакти) — Я довольствовался", "אסתפק (Эстапек) — Я обойдусь"),
+    make_v2_verb("לפרגן",   "Лефарген",  "Радоваться за другого/хвалить",
+        "אני מפרגן (Ани мефарген)", "פירגנתי (Пирганти) — Я хвалил", "אפרגן (Эфарген) — Я похвалю"),
+    make_v2_verb("להשלים",  "Лехашлим",  "Смириться/завершить",
+        "הוא משלים (Ху машлим)", "השלמתי (Хишламти) — Я смирился", "אשלים (Ашлим) — Я завершу"),
+    make_v2_verb("לחדש",    "Лехадеш",   "Обновлять/возобновлять",
+        "אני מחדש (Ани мехадеш)", "חידשתי (Хидашти) — Я обновил", "אחדש (Эхадеш) — Я обновлю"),
+    make_v2_verb("להעביר",  "Лехаавир",  "Передавать/переводить",
+        "הוא מעביר (Ху маавир)", "העברתי (Хеевирти) — Я передал", "אעביר (Аавир) — Я передам"),
+    make_v2_verb("לאחד",    "Леахед",    "Объединять",
+        "אנחנו מאחדים (Анахну меахдим)", "איחדתי (Ихадти) — Я объединял", "אאחד (Эахед) — Я объединю"),
+    make_v2_verb("להפריד",  "Лехафрид",  "Разделять/разлучать",
+        "הוא מפריד (Ху мафрид)", "הפרדתי (Хифрадти) — Я разделял", "אפריד (Африд) — Я разделю"),
+    make_v2_verb("לשתף",    "Летатеф",   "Делиться/привлекать",
+        "אני משתף (Ани мешатеф)", "שיתפתי (Шитафти) — Я делился", "אשתף (Эшатеф) — Я поделюсь"),
+    make_v2_verb("להכליל",  "Лехаклиль", "Обобщать/включать",
+        "הוא מכליל (Ху махлиль)", "הכללתי (Хихлальти) — Я обобщил", "אכליל (Ахлиль) — Я обобщу"),
+]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  СТРУКТУРА КУРСА: части по вариантам
+# ═══════════════════════════════════════════════════════════════════════════════
+COURSE = {
+    1: {  # Вариант 1
+        1: {  # Часть 1
+            "Приветствия 👋":    V1_P1_GREETINGS,
+            "Числа 1–10 🔢":    V1_P1_NUMBERS,
+            "Глаголы (10) 🔥":  V1_P1_VERBS,
+            "Слова (100) 📖":   V1_P1_WORDS,
+        },
+        2: {  # Часть 2
+            "Числа 11–1000 🔢": V1_P2_NUMBERS,
+            "Глаголы (50) 🔥":  V1_P2_VERBS,
+            "Слова (200) 📖":   V1_P2_WORDS,
+        },
+        3: {  # Часть 3
+            "Большие числа 🔢": V1_P3_NUMBERS,
+            "Глаголы (30+) 🔥": V1_P3_VERBS,
+            "Слова (30+) 📖":   V1_P3_WORDS,
+        },
+    },
+    2: {  # Вариант 2 (глаголы с временами)
+        1: {
+            "Приветствия 👋":        V1_P1_GREETINGS,
+            "Числа 1–100 🔢":       V1_P1_NUMBERS + V1_P2_NUMBERS[:10],
+            "Глаголы: 3 времени 🔥": V2_P1_VERBS,
+            "Слова (100) 📖":        V1_P1_WORDS,
+        },
+        2: {
+            "Числа 101–10001 🔢":    V1_P2_NUMBERS[10:] + V1_P3_NUMBERS[:4],
+            "Глаголы: 3 времени 🔥": V2_P2_VERBS,
+            "Слова (200) 📖":        V1_P2_WORDS,  # Часть 1 уже изучена
+        },
+        3: {
+            "Большие числа 🔢":      V1_P3_NUMBERS,
+            "Глаголы: 3 времени 🔥": V2_P3_VERBS,
+            "Слова (30+) 📖":        V1_P3_WORDS,
+        },
+    },
+}
+
+# Короткие коды разделов для callback_data (Telegram лимит 64 байта)
+SEC_CODES = {}
+SEC_BY_CODE = {}
+def _init_sec_codes():
+    idx = 0
+    for v in COURSE.values():
+        for p in v.values():
+            for title in p.keys():
+                if title not in SEC_CODES:
+                    SEC_CODES[title] = str(idx)
+                    SEC_BY_CODE[str(idx)] = title
+                    idx += 1
+_init_sec_codes()
+
+DAILY_TIPS = [
+    "💡 Иврит читается справа налево!",
+    "💡 В иврите нет заглавных букв.",
+    "💡 «Шалом» (שלום) = привет, пока и мир одновременно!",
+    "💡 Глаголы в иврите меняются по роду (мужской/женский).",
+    "💡 Первая буква алфавита — «алеф» (א).",
+    "💡 «Тода раба» (תודה רבה) = большое спасибо.",
+    "💡 «Бесэдэр» (בסדר) — любимое слово израильтян: «ок», «нормально».",
+    "💡 В иврите корень слова обычно состоит из трёх согласных.",
+    "💡 Иврит возрождён как разговорный язык только в XIX–XX веке.",
+    "💡 «Сабра» — израильтянин по рождению (и вид кактуса)!",
+]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ДАННЫЕ ПОЛЬЗОВАТЕЛЕЙ
+# ═══════════════════════════════════════════════════════════════════════════════
 def load_data() -> dict:
     if DATA_FILE.exists():
         with open(DATA_FILE) as f:
@@ -725,798 +1010,610 @@ def save_data(data: dict):
     with open(DATA_FILE, "w") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-def get_user(user_id: int) -> dict:
+def get_user(uid: int) -> dict:
     data = load_data()
-    uid = str(user_id)
-    if uid not in data:
-        data[uid] = {
+    key = str(uid)
+    if key not in data:
+        data[key] = {
+            "variant": 0,     # 0 — не выбран
+            "part": 1,
             "learned": [],
             "streak": 0,
             "last_active": None,
-            "total_phrases": 0,
-            "reminders": True,
-            "current_lesson": None,
             "quiz_score": 0,
             "quiz_total": 0,
-            "version": 1,
-            "level": 1,
+            "reminders": True,
         }
         save_data(data)
-    return data[uid]
+    return data[key]
 
-def update_user(user_id: int, updates: dict):
+def upd(uid: int, changes: dict):
     data = load_data()
-    uid = str(user_id)
-    if uid not in data:
-        data[uid] = {}
-    data[uid].update(updates)
+    key = str(uid)
+    if key not in data:
+        data[key] = {}
+    data[key].update(changes)
     save_data(data)
 
-def update_streak(user_id: int):
-    user = get_user(user_id)
+def item_word(sec_title: str) -> str:
+    """Возвращает правильное слово для типа контента."""
+    t = sec_title.lower()
+    if "глагол" in t:
+        return "глаголов"
+    elif "числ" in t:
+        return "чисел"
+    else:
+        return "слов"
+
+def item_word_acc(sec_title: str) -> str:
+    """Винительный падеж — 'слово', 'глагол', 'число'."""
+    t = sec_title.lower()
+    if "глагол" in t:
+        return "глагол"
+    elif "числ" in t:
+        return "число"
+    else:
+        return "слово"
+
+def get_unlearned(uid: int, sec_title: str, phrases: list) -> list:
+    """Возвращает только не выученные элементы из списка."""
+    learned = get_user(uid).get("learned", [])
+    result = []
+    for i, p in enumerate(phrases):
+        key = f"{sec_title}|{i}"
+        if key not in learned:
+            result.append((i, p))  # (оригинальный индекс, элемент)
+    return result
+
+def update_streak(uid: int):
+    u = get_user(uid)
     today = datetime.now().date().isoformat()
-    last = user.get("last_active")
-    streak = user.get("streak", 0)
-    if last != today:
-        yesterday = (datetime.now().date() - timedelta(days=1)).isoformat()
-        if last == yesterday:
-            streak += 1
-        else:
-            streak = 1
-        update_user(user_id, {"streak": streak, "last_active": today})
+    last = u.get("last_active")
+    if last == today:
+        return
+    streak = u.get("streak", 0)
+    yesterday = (datetime.now().date() - timedelta(days=1)).isoformat()
+    streak = streak + 1 if last == yesterday else 1
+    upd(uid, {"streak": streak, "last_active": today})
 
-# ─── Keyboards ────────────────────────────────────────────────────────────────
-def main_menu_keyboard(version: int = 1, level: int = 1):
-    buttons = [
-        ["📚 Уроки", "📊 Мой прогресс"],
-        ["🎯 Тест глаголы", "🎯 Тест слова"],
-        ["💡 Совет дня", "⚙️ Настройки"],
-    ]
-    if level >= 2:
-        buttons.insert(2, ["🔢 Тест числа"])
-    else:
-        buttons.insert(2, ["🔢 Тест числа"])
-    
-    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+# ═══════════════════════════════════════════════════════════════════════════════
+#  КЛАВИАТУРЫ
+# ═══════════════════════════════════════════════════════════════════════════════
+def main_kb():
+    return ReplyKeyboardMarkup([
+        ["📚 Уроки", "🎯 Тест"],
+        ["📊 Прогресс", "💡 Совет дня"],
+        ["✉️ Пожелания", "⚙️ Настройки"],
+    ], resize_keyboard=True)
 
-def get_menu_keyboard(user_id: int):
-    user = get_user(user_id)
-    version = user.get("version", 1)
-    level = user.get("level", 1)
-    return main_menu_keyboard(version, level)
-
-def lessons_keyboard(version: int = 1, level: int = 1):
-    buttons = []
-    lessons = get_all_lessons(version, level)
-    for key, lesson in lessons.items():
-        buttons.append([InlineKeyboardButton(lesson["title"], callback_data=f"lesson_{key}")])
-    
-    # Кнопка для смены уровня
-    if level == 1:
-        buttons.append([InlineKeyboardButton("⬆️ Уровень 2", callback_data="level_up")])
-    else:
-        buttons.append([InlineKeyboardButton("⬇️ Уровень 1", callback_data="level_down")])
-    
-    buttons.append([InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")])
-    return InlineKeyboardMarkup(buttons)
-
-def phrase_keyboard(lesson_key: str, phrase_idx: int, total: int, version: int = 1, level: int = 1):
-    row1 = []
-    if phrase_idx > 0:
-        row1.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"phrase_{lesson_key}_{phrase_idx-1}"))
-    if phrase_idx < total - 1:
-        row1.append(InlineKeyboardButton("Вперёд ➡️", callback_data=f"phrase_{lesson_key}_{phrase_idx+1}"))
-
-    row2 = [
-        InlineKeyboardButton("🔊 Произношение", callback_data=f"audio_{lesson_key}_{phrase_idx}"),
-        InlineKeyboardButton("✅ Выучил!", callback_data=f"learned_{lesson_key}_{phrase_idx}"),
-    ]
-    row3 = [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]
-
+def parts_kb(variant: int, current_part: int):
     rows = []
-    if row1:
-        rows.append(row1)
-    rows.append(row2)
-    rows.append(row3)
+    for p in [1, 2, 3]:
+        label = f"{'✅ ' if p == current_part else ''}Часть {p}"
+        rows.append([InlineKeyboardButton(label, callback_data=f"part_{p}")])
+    rows.append([InlineKeyboardButton("🔄 Сменить вариант", callback_data="change_variant")])
     return InlineKeyboardMarkup(rows)
 
-# ─── Handlers ─────────────────────────────────────────────────────────────────
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    update_streak(user.id)
-    buttons = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("Версия 1", callback_data="set_version_1"),
-            InlineKeyboardButton("Версия 2", callback_data="set_version_2"),
-        ],
-    ])
-    await update.message.reply_text(
-        f"שלום, {user.first_name}! 👋\n\n"
-        "Добро пожаловать в бот для изучения иврита!\n\n"
-        "Выберите версию:\n"
-        "• *Версия 1* — транслитерация на русском\n"
-        "• *Версия 2* — транслитерация на русском, глаголы в трёх временах с примерами употребления",
-        parse_mode="Markdown",
-        reply_markup=buttons
-    )
+def lessons_kb(variant: int, part: int):
+    sections = COURSE[variant][part]
+    rows = []
+    for title in sections:
+        rows.append([InlineKeyboardButton(title, callback_data=f"sec|{title}")])
+    rows.append([InlineKeyboardButton("← Назад к частям", callback_data="back_parts")])
+    return InlineKeyboardMarkup(rows)
 
-async def level_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Меню выбора уровня"""
-    user_id = update.effective_user.id
-    user = get_user(user_id)
-    current_level = user.get("level", 1)
-    version = user.get("version", 1)
-    
-    text = f"📊 *Ваш текущий уровень: {current_level}*\n\n"
-    if current_level == 1:
-        text += "Уровень 1: базовые слова и фразы\n"
-        text += "Уровень 2: расширенный словарь\n\n"
+def phrase_kb(sec_title: str, pos: int, total_unlearned: int, orig_idx: int):
+    """pos — позиция среди невыученных (0-based), orig_idx — оригинальный индекс в списке."""
+    nav = []
+    if pos > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"ph|{sec_title}|{pos-1}"))
+    if pos < total_unlearned - 1:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"ph|{sec_title}|{pos+1}"))
+
+    rows = []
+    if nav:
+        rows.append(nav)
+    rows.append([
+        InlineKeyboardButton("🔊 Аудио", callback_data=f"au|{sec_title}|{orig_idx}"),
+        InlineKeyboardButton("✅ Выучил", callback_data=f"lrn|{sec_title}|{orig_idx}|{pos}"),
+    ])
+    code = SEC_CODES.get(sec_title, "0")
+    rows.append([InlineKeyboardButton("🎯 Тест по этой теме", callback_data=f"qs|{code}")])
+    rows.append([InlineKeyboardButton("← К урокам", callback_data="back_lessons")])
+    return InlineKeyboardMarkup(rows)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ОТОБРАЖЕНИЕ ФРАЗЫ
+# ═══════════════════════════════════════════════════════════════════════════════
+def phrase_text(phrase: dict, variant: int, idx: int, total: int, sec_title: str) -> str:
+    he = phrase["he"]
+    tr = phrase["tr"]
+    ru = phrase["ru"]
+    lines = [
+        f"*{sec_title}* — {idx+1}/{total}\n",
+        f"🇮🇱 `{he}`",
+        f"👄 _{tr}_",
+        f"🇷🇺 {ru}",
+    ]
+    if "now" in phrase:
+        lines.append(f"\n🕐 *Настоящее:* {phrase['now']}")
+    if variant == 2:
+        if "past" in phrase:
+            lines.append(f"🕰 *Прошедшее:* {phrase['past']}")
+        if "future" in phrase:
+            lines.append(f"🔮 *Будущее:* {phrase['future']}")
+    return "\n".join(lines)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  HANDLERS
+# ═══════════════════════════════════════════════════════════════════════════════
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    update_streak(uid)
+    u = get_user(uid)
+    if u["variant"] == 0:
+        await show_variant_choice(update.message)
     else:
-        text += "Уровень 2: расширенный словарь\n\n"
-    
-    text += "Выберите уровень для изучения:"
-    
-    buttons = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📚 Уровень 1", callback_data="set_level_1")],
-        [InlineKeyboardButton("📚 Уровень 2", callback_data="set_level_2")],
-        [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")],
-    ])
-    
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=buttons)
-
-async def lessons_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user = get_user(user_id)
-    version = user.get("version", 1)
-    level = user.get("level", 1)
-    await update.message.reply_text(
-        f"📚 *Выберите тему урока (Уровень {level}):*",
-        parse_mode="Markdown",
-        reply_markup=lessons_keyboard(version, level)
-    )
-
-async def show_phrase(query, lesson_key: str, phrase_idx: int, version: int = 1, level: int = 1):
-    lesson = get_lesson_by_key(version, level, lesson_key)
-    if not lesson:
-        await query.edit_message_text("❌ Урок не найден.")
-        return
-    
-    phrase = lesson["phrases"][phrase_idx]
-    total = len(lesson["phrases"])
-
-    text = (
-        f"{lesson['title']} — фраза {phrase_idx + 1}/{total}\n\n"
-        f"🇮🇱 *Иврит:*\n"
-        f"```\n{phrase['he']}\n```\n\n"
-        f"🔤 *Транслитерация:*\n_{phrase['translit']}_\n\n"
-        f"🇷🇺 *По-русски:*\n{phrase['ru']}"
-    )
-
-    # Добавляем пример для версии 2
-    if version == 2 and "example" in phrase and phrase["example"]:
-        text += f"\n\n📝 *Пример:*\n_{phrase['example']}_"
-
-    await query.edit_message_text(
-        text,
-        parse_mode="Markdown",
-        reply_markup=phrase_keyboard(lesson_key, phrase_idx, total, version, level)
-    )
-
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    user_id = query.from_user.id
-    user = get_user(user_id)
-    version = user.get("version", 1)
-    level = user.get("level", 1)
-
-    if data.startswith("set_version_"):
-        version = int(data.split("_")[-1])
-        update_user(user_id, {"version": version, "level": 1})
-        if version == 1:
-            desc = "транслитерация на *русском*"
-        else:
-            desc = "транслитерация на *русском*, глаголы в трёх временах с примерами употребления"
-        await query.edit_message_text(
-            f"✅ *Версия {version}* выбрана — {desc}!\n\n"
-            "Здесь вы найдёте:\n"
-            "📚 *Уроки* — фразы с транслитерацией\n"
-            "🎯 *Тест* — проверь свои знания\n"
-            "📊 *Прогресс* — следи за успехами\n"
-            "💡 *Совет дня* — интересные факты\n\n"
-            "Иврит читается *справа налево* — начнём! 🇮🇱",
-            parse_mode="Markdown",
-        )
-        await query.message.reply_text("Выберите раздел:", reply_markup=get_menu_keyboard(user_id))
-
-    elif data.startswith("set_level_"):
-        level = int(data.split("_")[-1])
-        update_user(user_id, {"level": level})
-        await query.edit_message_text(
-            f"✅ *Уровень {level}* выбран!\n\n"
-            f"Теперь доступны уроки уровня {level}.",
-            parse_mode="Markdown"
-        )
-        await query.message.reply_text("Выберите раздел:", reply_markup=get_menu_keyboard(user_id))
-
-    elif data == "level_up":
-        if level == 1:
-            update_user(user_id, {"level": 2})
-            await query.edit_message_text(
-                "✅ *Переключено на уровень 2*\n\n"
-                "Теперь доступны расширенные уроки!",
-                parse_mode="Markdown"
-            )
-            await query.message.reply_text("Выберите раздел:", reply_markup=get_menu_keyboard(user_id))
-        else:
-            await query.answer("Вы уже на уровне 2!")
-
-    elif data == "level_down":
-        if level == 2:
-            update_user(user_id, {"level": 1})
-            await query.edit_message_text(
-                "✅ *Переключено на уровень 1*\n\n"
-                "Базовые уроки снова доступны.",
-                parse_mode="Markdown"
-            )
-            await query.message.reply_text("Выберите раздел:", reply_markup=get_menu_keyboard(user_id))
-        else:
-            await query.answer("Вы уже на уровне 1!")
-
-    elif data.startswith("lesson_"):
-        lesson_key = data[7:]
-        context.user_data["lesson"] = lesson_key
-        await show_phrase(query, lesson_key, 0, version, level)
-
-    elif data.startswith("phrase_"):
-        # Парсим: phrase_lesson_key_idx
-        parts = data.split("_")
-        if len(parts) < 3:
-            await query.answer("❌ Ошибка: неверный формат")
-            return
-        lesson_key = "_".join(parts[1:-1])
-        idx_str = parts[-1]
-        try:
-            phrase_idx = int(idx_str)
-        except ValueError:
-            await query.answer("❌ Ошибка: неверный индекс")
-            return
-        await show_phrase(query, lesson_key, phrase_idx, version, level)
-
-    elif data.startswith("audio_"):
-        # Парсим: audio_lesson_key_idx
-        parts = data.split("_")
-        if len(parts) < 3:
-            await query.answer("❌ Ошибка: неверный формат")
-            return
-        
-        # Склеиваем части для lesson_key (между audio_ и последним _)
-        lesson_key = "_".join(parts[1:-1])
-        idx_str = parts[-1]
-        
-        try:
-            phrase_idx = int(idx_str)
-        except ValueError:
-            await query.answer("❌ Ошибка: неверный индекс")
-            return
-        
-        # Получаем фразу
-        phrase = get_phrase_by_key(version, level, lesson_key, phrase_idx)
-        if not phrase:
-            await query.answer(f"❌ Фраза не найдена")
-            logger.error(f"Фраза не найдена: lesson_key={lesson_key}, idx={phrase_idx}, level={level}, version={version}")
-            return
-        
-        he_text = phrase["he"]
-        
-        await query.answer("🔊 Генерирую произношение...", show_alert=False)
-        
-        try:
-            # Используем улучшенный TTS
-            audio_bytes = get_hebrew_tts(he_text)
-            
-            # Отправляем как голосовое сообщение
-            caption = f"🇮🇱 {he_text}\n👄 {phrase['translit']}\n🇷🇺 {phrase['ru']}"
-            if version == 2 and "example" in phrase and phrase["example"]:
-                caption += f"\n📝 {phrase['example']}"
-            
-            await query.message.reply_voice(
-                voice=io.BytesIO(audio_bytes),
-                caption=caption,
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            logger.error(f"TTS error for {he_text}: {e}")
-            await query.message.reply_text(
-                f"❌ Не удалось загрузить аудио.\n\n"
-                f"👄 *Читается:* {phrase['translit']}\n"
-                f"Повторите вслух несколько раз!\n\n"
-                f"💡 *Совет:* Попробуйте произнести слово по слогам.",
-                parse_mode="Markdown"
-            )
-
-    elif data.startswith("learned_"):
-        # Парсим: learned_lesson_key_idx
-        parts = data.split("_")
-        if len(parts) < 3:
-            await query.answer("❌ Ошибка: неверный формат")
-            return
-        lesson_key = "_".join(parts[1:-1])
-        idx_str = parts[-1]
-        try:
-            phrase_idx = int(idx_str)
-        except ValueError:
-            await query.answer("❌ Ошибка: неверный индекс")
-            return
-        
-        key = f"{lesson_key}_{phrase_idx}"
-        user_data = get_user(user_id)
-        learned = user_data.get("learned", [])
-        total_phrases = user_data.get("total_phrases", 0)
-        
-        lesson = get_lesson_by_key(version, level, lesson_key)
-        if not lesson:
-            await query.answer("❌ Урок не найден")
-            return
-        total = len(lesson["phrases"])
-        next_idx = phrase_idx + 1
-        
-        if key not in learned:
-            learned.append(key)
-            total_phrases += 1
-            update_user(user_id, {"learned": learned, "total_phrases": total_phrases})
-            await query.answer("✅ Отлично! Фраза добавлена в выученные!", show_alert=False)
-            
-            if next_idx < total:
-                await show_phrase(query, lesson_key, next_idx, version, level)
-            else:
-                await query.edit_message_text(
-                    f"🎉 *Поздравляю!* Вы выучили все фразы в этом уроке!\n\n"
-                    f"📚 {lesson['title']} — завершён!\n\n"
-                    f"Выберите другой урок или вернитесь в меню.",
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("📚 Другой урок", callback_data="go_lessons")],
-                        [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")],
-                    ])
-                )
-        else:
-            await query.answer("Вы уже выучили эту фразу! 🌟", show_alert=False)
-            if next_idx < total:
-                await show_phrase(query, lesson_key, next_idx, version, level)
-
-    elif data == "main_menu":
-        await query.edit_message_text(
-            "Выберите раздел 👇",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📚 Уроки", callback_data="go_lessons")],
-                [InlineKeyboardButton("🎯 Тест", callback_data="go_quiz")],
-                [InlineKeyboardButton("📊 Уровень", callback_data="go_level")],
-            ])
+        await update.message.reply_text(
+            f"שלום! 👋 Добро пожаловать обратно!\n"
+            f"Вариант {u['variant']}, Часть {u['part']}",
+            reply_markup=main_kb()
         )
 
-    elif data == "go_lessons":
-        await query.edit_message_text(
-            f"📚 *Выберите тему урока (Уровень {level}):*",
-            parse_mode="Markdown",
-            reply_markup=lessons_keyboard(version, level)
-        )
-
-    elif data == "go_quiz":
-        await query.edit_message_text(
-            "🎯 *Выберите тест:*",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🎯 Тест глаголы", callback_data="quiz_type_verbs")],
-                [InlineKeyboardButton("🎯 Тест слова", callback_data="quiz_type_words")],
-                [InlineKeyboardButton("🔢 Тест числа", callback_data="quiz_type_numbers")],
-            ])
-        )
-
-    elif data == "go_level":
-        await query.edit_message_text(
-            f"📊 *Ваш текущий уровень: {level}*\n\n"
-            "Выберите уровень для изучения:",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📚 Уровень 1", callback_data="set_level_1")],
-                [InlineKeyboardButton("📚 Уровень 2", callback_data="set_level_2")],
-                [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")],
-            ])
-        )
-
-    elif data.startswith("quiz_type_"):
-        quiz_type = data[len("quiz_type_"):]
-        await send_quiz_question(query, user_id, context, quiz_type)
-
-    elif data.startswith("quiz_"):
-        await handle_quiz_answer(query, user_id, data, context)
-
-async def progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    update_streak(user_id)
-    user_data = get_user(user_id)
-    version = user_data.get("version", 1)
-    level = user_data.get("level", 1)
-
-    # Подсчёт общего количества фраз
-    lessons = get_all_lessons(version, level)
-    total_available = sum(len(l["phrases"]) for l in lessons.values())
-    learned = len(user_data.get("learned", []))
-    streak = user_data.get("streak", 0)
-    quiz_score = user_data.get("quiz_score", 0)
-    quiz_total = user_data.get("quiz_total", 0)
-    accuracy = round(quiz_score / quiz_total * 100) if quiz_total > 0 else 0
-
-    bar_len = 10
-    filled = round(learned / total_available * bar_len) if total_available > 0 else 0
-    bar = "🟩" * filled + "⬜" * (bar_len - filled)
-
-    text = (
-        f"📊 *Ваш прогресс*\n\n"
-        f"🔥 Серия дней: *{streak}* {'🏆' if streak >= 7 else ''}\n"
-        f"📚 Уровень: *{level}*\n"
-        f"📱 Версия: *{version}*\n\n"
-        f"📚 Выучено фраз:\n"
-        f"{bar} {learned}/{total_available}\n\n"
-        f"🎯 Тесты: *{quiz_score}/{quiz_total}* правильных ({accuracy}%)\n\n"
-        f"{'🌟 Вы освоили все фразы! Попробуйте тест!' if learned == total_available else '👉 Продолжайте учиться!'}"
-    )
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-async def daily_tip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tip = random.choice(DAILY_TIPS)
-    await update.message.reply_text(tip)
-
-async def quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает меню выбора теста"""
-    user_id = update.effective_user.id
-    await update.message.reply_text(
-        "🎯 *Выберите тест:*",
+async def show_variant_choice(message):
+    await message.reply_text(
+        "🇮🇱 *Добро пожаловать в бот для изучения иврита!*\n\n"
+        "Слова и глаголы расположены по частоте употребления.\n\n"
+        "*Выберите вариант:*\n\n"
+        "📘 *Вариант 1* — глаголы только в настоящем времени\n"
+        "• Часть 1: приветствия, числа 1–10, 10 глаголов, 100 слов\n"
+        "• Часть 2: числа 11–1000, 50 глаголов, 200 слов\n"
+        "• Часть 3: большие числа, остальные глаголы и слова\n\n"
+        "📗 *Вариант 2* — глаголы в трёх временах\n"
+        "• Часть 1: приветствия, числа 1–100, 10 глаголов, 100 слов\n"
+        "• Часть 2: числа 101–10001, 50 глаголов, 300 слов\n"
+        "• Часть 3: большие числа, остальные глаголы и слова",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🎯 Тест глаголы", callback_data="quiz_type_verbs")],
-            [InlineKeyboardButton("🎯 Тест слова", callback_data="quiz_type_words")],
-            [InlineKeyboardButton("🔢 Тест числа", callback_data="quiz_type_numbers")],
+            [InlineKeyboardButton("Вариант 1", callback_data="var_1"),
+             InlineKeyboardButton("Вариант 2", callback_data="var_2")],
         ])
     )
 
-async def send_quiz_question(query, user_id: int, context, quiz_type: str = "words"):
-    user_data = get_user(user_id)
-    version = user_data.get("version", 1)
-    level = user_data.get("level", 1)
+async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    uid = update.effective_user.id
+    update_streak(uid)
 
-    pool = get_quiz_pool(version, level, quiz_type)
-    
-    if quiz_type == "verbs":
-        title = "🔥 Тест: глаголы"
-    elif quiz_type == "numbers":
-        title = "🔢 Тест: числа"
+    if text == "📚 Уроки":
+        u = get_user(uid)
+        if u["variant"] == 0:
+            await show_variant_choice(update.message)
+        else:
+            await update.message.reply_text(
+                f"📚 *Выберите часть* (Вариант {u['variant']}):",
+                parse_mode="Markdown",
+                reply_markup=parts_kb(u["variant"], u["part"])
+            )
+    elif text == "🎯 Тест":
+        await start_quiz(update.message, uid, ctx)  # sec_title=None — весь пул
+    elif text == "📊 Прогресс":
+        await show_progress(update.message, uid)
+    elif text == "💡 Совет дня":
+        await update.message.reply_text(random.choice(DAILY_TIPS))
+    elif text == "✉️ Пожелания":
+        await update.message.reply_text(
+            "✉️ *Пожелания и замечания*\n\n"
+            "Нажмите кнопку ниже — откроется чат с разработчиком.\n"
+            "Напишите ваше пожелание или замечание.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💬 Написать @aaron_ast", url="https://t.me/aaron_ast")],
+            ])
+        )
+    elif text == "⚙️ Настройки":
+        await show_settings(update.message, uid)
     else:
-        title = "📖 Тест: слова"
+        await update.message.reply_text("Выберите раздел 👇", reply_markup=main_kb())
 
-    if len(pool) < 4:
-        await query.edit_message_text("Недостаточно фраз для теста.")
-        return
+async def show_progress(message, uid: int):
+    u = get_user(uid)
+    variant = u.get("variant", 0)
+    part = u.get("part", 1)
+    learned = len(u.get("learned", []))
+    streak = u.get("streak", 0)
+    qs = u.get("quiz_score", 0)
+    qt = u.get("quiz_total", 0)
+    pct = round(qs / qt * 100) if qt else 0
 
-    correct = random.choice(pool)
-    wrong_options = random.sample([p for p in pool if p["he"] != correct["he"]], min(3, len(pool)-1))
-    all_options = [correct] + wrong_options
-    random.shuffle(all_options)
-    correct_pos = next(i for i, p in enumerate(all_options) if p["he"] == correct["he"])
-
-    context.user_data["quiz_correct"] = correct_pos
-    context.user_data["quiz_phrase"] = correct
-    context.user_data["quiz_type"] = quiz_type
-    context.user_data["quiz_pool"] = pool
-
-    text = f"{title} (Уровень {level})\n\nКак переводится:\n\n🇮🇱 _{correct['he']}_\n🔤 ({correct['translit']})\n\n"
-    
-    # Добавляем пример для версии 2
-    if version == 2 and "example" in correct and correct["example"]:
-        text += f"📝 *Пример:* {correct['example']}\n\n"
-    
-    text += "Выберите правильный перевод:"
-
-    buttons = [[InlineKeyboardButton(opt["ru"], callback_data=f"quiz_{i}")] for i, opt in enumerate(all_options)]
-
-    await query.edit_message_text(
-        text,
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
-
-async def handle_quiz_answer(query, user_id: int, data: str, context):
-    chosen = int(data.split("_")[1])
-    correct_pos = context.user_data.get("quiz_correct")
-    correct_phrase = context.user_data.get("quiz_phrase", {})
-    quiz_type = context.user_data.get("quiz_type", "words")
-    pool = context.user_data.get("quiz_pool", [])
-
-    if correct_pos is None:
-        await query.edit_message_text("Начните тест заново — нажмите кнопку теста")
-        return
-
-    user_data = get_user(user_id)
-    version = user_data.get("version", 1)
-    quiz_total = user_data.get("quiz_total", 0) + 1
-    quiz_score = user_data.get("quiz_score", 0)
-
-    is_correct = (chosen == correct_pos)
-    if is_correct:
-        quiz_score += 1
-
-    update_user(user_id, {"quiz_score": quiz_score, "quiz_total": quiz_total})
-
-    result = "✅ *Правильно!*" if is_correct else "❌ *Неправильно.*"
-    result += f"\n\n🇮🇱 {correct_phrase.get('he', '')}\n"
-    result += f"🔤 {correct_phrase.get('translit', '')}\n"
-    result += f"🇷🇺 {correct_phrase.get('ru', '')}"
-
-    if version == 2 and "example" in correct_phrase and correct_phrase["example"]:
-        result += f"\n\n📝 {correct_phrase['example']}"
-
-    context.user_data["last_result"] = result
-    
-    if pool and len(pool) >= 4:
-        remaining = [p for p in pool if p["he"] != correct_phrase["he"]]
-        if len(remaining) >= 4:
-            context.user_data["quiz_pool"] = remaining
-            await query.edit_message_text(result, parse_mode="Markdown")
-            await send_next_quiz_question(query.message, user_id, context, quiz_type, remaining)
-            return
-
-    context.user_data.pop("quiz_correct", None)
-    context.user_data.pop("quiz_phrase", None)
-    context.user_data.pop("quiz_pool", None)
-
-    buttons = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Новый тест", callback_data=f"quiz_type_{quiz_type}")],
-        [InlineKeyboardButton("📊 Мой счёт", callback_data="show_score")],
-        [InlineKeyboardButton("🏠 Меню", callback_data="main_menu")],
-    ])
-    await query.edit_message_text(
-        f"{result}\n\n🎯 Тест завершён!",
-        parse_mode="Markdown",
-        reply_markup=buttons
-    )
-
-async def send_next_quiz_question(message, user_id: int, context, quiz_type: str, pool: list):
-    user_data = get_user(user_id)
-    version = user_data.get("version", 1)
-    level = user_data.get("level", 1)
-
-    if len(pool) < 4:
-        await message.reply_text("✅ Тест завершён! Вы ответили на все вопросы.")
-        return
-
-    correct = random.choice(pool)
-    wrong_options = random.sample([p for p in pool if p["he"] != correct["he"]], min(3, len(pool)-1))
-    all_options = [correct] + wrong_options
-    random.shuffle(all_options)
-    correct_pos = next(i for i, p in enumerate(all_options) if p["he"] == correct["he"])
-
-    context.user_data["quiz_correct"] = correct_pos
-    context.user_data["quiz_phrase"] = correct
-    context.user_data["quiz_type"] = quiz_type
-    context.user_data["quiz_pool"] = pool
-
-    if quiz_type == "verbs":
-        title = "🔥 Тест: глаголы"
-    elif quiz_type == "numbers":
-        title = "🔢 Тест: числа"
+    if variant:
+        total = sum(len(v) for v in COURSE[variant][part].values())
+        bar = "🟩" * min(10, round(learned / max(total, 1) * 10)) + "⬜" * (10 - min(10, round(learned / max(total, 1) * 10)))
+        prog = f"📚 Выучено в текущей части:\n{bar} {learned}/{total}"
     else:
-        title = "📖 Тест: слова"
-
-    text = f"{title} (Уровень {level})\n\nКак переводится:\n\n🇮🇱 _{correct['he']}_\n🔤 ({correct['translit']})\n\n"
-    
-    if version == 2 and "example" in correct and correct["example"]:
-        text += f"📝 *Пример:* {correct['example']}\n\n"
-    
-    text += "Выберите правильный перевод:"
-
-    buttons = [[InlineKeyboardButton(opt["ru"], callback_data=f"quiz_{i}")] for i, opt in enumerate(all_options)]
+        prog = "Вариант не выбран"
 
     await message.reply_text(
-        text,
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(buttons)
+        f"📊 *Ваш прогресс*\n\n"
+        f"🔥 Серия дней: *{streak}* {'🏆' if streak >= 7 else ''}\n"
+        f"📘 Вариант: *{variant or 'не выбран'}*  Часть: *{part}*\n\n"
+        f"{prog}\n\n"
+        f"🎯 Тесты: *{qs}/{qt}* ({pct}%)",
+        parse_mode="Markdown"
     )
 
-async def next_quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    if data.startswith("next_quiz_"):
-        quiz_type = data[len("next_quiz_"):]
-        await send_quiz_question(query, query.from_user.id, context, quiz_type)
-    elif data == "show_score":
-        user_data = get_user(query.from_user.id)
-        score = user_data.get("quiz_score", 0)
-        total = user_data.get("quiz_total", 0)
-        pct = round(score / total * 100) if total else 0
-        await query.edit_message_text(
-            f"📊 *Ваш счёт в тестах*\n\n"
-            f"✅ Правильных: {score}/{total} ({pct}%)\n\n"
-            f"{'🏆 Отличный результат!' if pct >= 80 else '💪 Продолжайте практиковаться!'}",
+async def show_settings(message, uid: int):
+    u = get_user(uid)
+    rem = u.get("reminders", True)
+    await message.reply_text(
+        f"⚙️ *Настройки*\n\n🔔 Напоминания: {'вкл ✅' if rem else 'выкл ❌'}",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                "🔔 Выключить" if rem else "🔔 Включить",
+                callback_data="toggle_rem"
+            )],
+            [InlineKeyboardButton("🗑 Сбросить прогресс", callback_data="reset_prog")],
+            [InlineKeyboardButton("🔄 Сменить вариант", callback_data="change_variant")],
+        ])
+    )
+
+# ── Quiz ─────────────────────────────────────────────────────────────────────
+def _build_quiz(uid: int, ctx, sec_title: str = None):
+    """Формирует вопрос теста. sec_title — ограничить пул конкретным разделом."""
+    u = get_user(uid)
+    variant = u["variant"]
+    part = u["part"]
+
+    if sec_title and sec_title in COURSE[variant][part]:
+        pool = list(COURSE[variant][part][sec_title])
+    else:
+        pool = []
+        for phrases in COURSE[variant][part].values():
+            pool.extend(phrases)
+
+    if len(pool) < 4:
+        return None, None, None, None
+
+    correct = random.choice(pool)
+    wrongs = random.sample([p for p in pool if p["he"] != correct["he"]], min(3, len(pool)-1))
+    options = [correct] + wrongs
+    random.shuffle(options)
+    correct_idx = next(i for i, p in enumerate(options) if p["he"] == correct["he"])
+
+    ctx.user_data["qz_correct"] = correct_idx
+    ctx.user_data["qz_phrase"] = correct
+    ctx.user_data["qz_sec"] = sec_title  # запоминаем раздел
+
+    label = sec_title if sec_title else f"Вариант {variant}, Часть {part}"
+    text = (
+        f"🎯 *Тест* ({label})\n\n"
+        f"Как переводится?\n\n"
+        f"🇮🇱 `{correct['he']}`\n"
+        f"👄 _{correct['tr']}_\n\n"
+        f"Выберите правильный перевод:"
+    )
+    if variant == 2 and "now" in correct:
+        text += f"\n\n🕐 {correct['now']}"
+
+    kb = InlineKeyboardMarkup(
+        [[InlineKeyboardButton(p["ru"], callback_data=f"qz_{i}")] for i, p in enumerate(options)]
+    )
+    return text, kb, correct_idx, correct
+
+async def start_quiz(message, uid: int, ctx, sec_title: str = None):
+    """Отправляет новый вопрос как reply на message."""
+    u = get_user(uid)
+    if u["variant"] == 0:
+        await message.reply_text("Сначала выберите вариант курса через 📚 Уроки")
+        return
+    text, kb, _, _ = _build_quiz(uid, ctx, sec_title)
+    if text is None:
+        await message.reply_text("Недостаточно слов для теста.")
+        return
+    await message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+
+async def next_quiz(q, uid: int, ctx):
+    """Редактирует текущее сообщение следующим вопросом."""
+    u = get_user(uid)
+    if u["variant"] == 0:
+        await q.edit_message_text("Сначала выберите вариант курса через 📚 Уроки")
+        return
+    # Берём раздел из файла (надёжнее чем ctx.user_data)
+    u2 = get_user(uid)
+    sec_title = ctx.user_data.get("qz_sec") or u2.get("current_sec")
+    text, kb, _, _ = _build_quiz(uid, ctx, sec_title)
+    if text is None:
+        await q.edit_message_text("Недостаточно слов для теста.")
+        return
+    await q.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
+
+# ── Callback handler ──────────────────────────────────────────────────────────
+async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    d = q.data
+    uid = q.from_user.id
+    u = get_user(uid)
+
+    # Выбор варианта
+    if d.startswith("var_"):
+        v = int(d[4:])
+        upd(uid, {"variant": v, "part": 1, "learned": []})
+        await q.edit_message_text(
+            f"✅ Выбран *Вариант {v}*!\n\n"
+            f"{'📘 Глаголы только в настоящем времени.' if v==1 else '📗 Глаголы в трёх временах (настоящее, прошедшее, будущее).'}\n\n"
+            f"Выберите раздел в меню ниже.",
+            parse_mode="Markdown"
+        )
+        await q.message.reply_text("Выберите раздел 👇", reply_markup=main_kb())
+
+    elif d == "change_variant":
+        await q.edit_message_text("Выберите вариант курса:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Вариант 1", callback_data="var_1"),
+                 InlineKeyboardButton("Вариант 2", callback_data="var_2")],
+            ])
+        )
+
+    # Выбор части
+    elif d.startswith("part_"):
+        part = int(d[5:])
+        upd(uid, {"part": part})
+        variant = get_user(uid)["variant"]
+        await q.edit_message_text(
+            f"📚 *Часть {part}* (Вариант {variant})\nВыберите тему:",
+            parse_mode="Markdown",
+            reply_markup=lessons_kb(variant, part)
+        )
+
+    elif d == "back_parts":
+        u2 = get_user(uid)
+        await q.edit_message_text(
+            f"📚 *Выберите часть* (Вариант {u2['variant']}):",
+            parse_mode="Markdown",
+            reply_markup=parts_kb(u2["variant"], u2["part"])
+        )
+
+    # Выбор темы
+    elif d.startswith("sec|"):
+        sec_title = d[4:]
+        ctx.user_data["sec"] = sec_title
+        upd(uid, {"current_sec": sec_title})  # сохраняем в файл
+        u2 = get_user(uid)
+        phrases = COURSE[u2["variant"]][u2["part"]][sec_title]
+        unlearned = get_unlearned(uid, sec_title, phrases)
+        if not unlearned:
+            await q.edit_message_text(
+                f"🎉 *{sec_title}*\n\nВы выучили все {item_word(sec_title)} в этом разделе!\n\nВыберите другой раздел.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("← К урокам", callback_data="back_lessons")],
+                ])
+            )
+            return
+        orig_idx, phrase = unlearned[0]
+        await q.edit_message_text(
+            phrase_text(phrase, u2["variant"], orig_idx, len(phrases), sec_title),
+            parse_mode="Markdown",
+            reply_markup=phrase_kb(sec_title, 0, len(unlearned), orig_idx)
+        )
+
+    elif d == "back_lessons":
+        u2 = get_user(uid)
+        await q.edit_message_text(
+            f"📚 *Часть {u2['part']}* — выберите тему:",
+            parse_mode="Markdown",
+            reply_markup=lessons_kb(u2["variant"], u2["part"])
+        )
+
+    # Навигация по словам/глаголам (pos — позиция среди невыученных)
+    elif d.startswith("ph|"):
+        _, sec_title, pos_s = d.split("|", 2)
+        pos = int(pos_s)
+        upd(uid, {"current_sec": sec_title})  # актуализируем раздел
+        u2 = get_user(uid)
+        phrases = COURSE[u2["variant"]][u2["part"]][sec_title]
+        unlearned = get_unlearned(uid, sec_title, phrases)
+        if not unlearned or pos >= len(unlearned):
+            await q.edit_message_text(
+                f"🎉 Все {item_word(sec_title)} в этом разделе выучены!",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("← К урокам", callback_data="back_lessons")
+                ]])
+            )
+            return
+        orig_idx, phrase = unlearned[pos]
+        await q.edit_message_text(
+            phrase_text(phrase, u2["variant"], orig_idx, len(phrases), sec_title),
+            parse_mode="Markdown",
+            reply_markup=phrase_kb(sec_title, pos, len(unlearned), orig_idx)
+        )
+
+    # Аудио
+    elif d.startswith("au|"):
+        _, sec_title, idx_s = d.split("|", 2)
+        idx = int(idx_s)
+        u2 = get_user(uid)
+        phrase = COURSE[u2["variant"]][u2["part"]][sec_title][idx]
+        he = phrase["he"]
+        await q.answer("🔊 Генерирую аудио...", show_alert=False)
+        try:
+            loop = asyncio.get_event_loop()
+            audio = await loop.run_in_executor(None, lambda: get_audio(he))
+            if audio:
+                await q.message.reply_voice(
+                    voice=io.BytesIO(audio),
+                    caption=f"🇮🇱 {he}\n👄 {phrase['tr']}\n🇷🇺 {phrase['ru']}"
+                )
+            else:
+                raise Exception("no audio")
+        except Exception as e:
+            logger.warning(f"Audio failed: {e}")
+            await q.message.reply_text(
+                f"🔊 *Произношение:*\n\n"
+                f"🇮🇱 `{he}`\n"
+                f"👄 _{phrase['tr']}_\n\n"
+                f"_Произнесите вслух несколько раз!_",
+                parse_mode="Markdown"
+            )
+
+    # Выучил (callback: lrn|sec_title|orig_idx|pos)
+    elif d.startswith("lrn|"):
+        parts = d.split("|")
+        # parts: ['lrn', sec_title, orig_idx, pos]
+        sec_title = parts[1]
+        orig_idx = int(parts[2])
+        pos = int(parts[3]) if len(parts) > 3 else 0
+        key = f"{sec_title}|{orig_idx}"
+        u2 = get_user(uid)
+        learned = u2.get("learned", [])
+        if key not in learned:
+            learned.append(key)
+            upd(uid, {"learned": learned})
+            await q.answer("✅ Выучено!", show_alert=False)
+        else:
+            await q.answer("Уже выучено 🌟", show_alert=False)
+        # Переходим к следующей невыученной
+        phrases = COURSE[u2["variant"]][u2["part"]][sec_title]
+        unlearned = get_unlearned(uid, sec_title, phrases)
+        if not unlearned:
+            await q.edit_message_text(
+                f"🎉 *{sec_title}*\n\nВы выучили все {item_word(sec_title)} в этом разделе!",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("← К урокам", callback_data="back_lessons")],
+                ])
+            )
+        else:
+            # Показываем ту же позицию (или последнюю если список стал короче)
+            new_pos = min(pos, len(unlearned) - 1)
+            new_orig_idx, phrase = unlearned[new_pos]
+            await q.edit_message_text(
+                phrase_text(phrase, u2["variant"], new_orig_idx, len(phrases), sec_title),
+                parse_mode="Markdown",
+                reply_markup=phrase_kb(sec_title, new_pos, len(unlearned), new_orig_idx)
+            )
+
+    # Тест
+    elif d.startswith("qs|"):
+        code = d[3:]
+        sec_title = SEC_BY_CODE.get(code)
+        upd(uid, {"current_sec": sec_title})
+        ctx.user_data["qz_sec"] = sec_title
+        await start_quiz(q.message, uid, ctx, sec_title=sec_title)
+
+    elif d == "qz_next":
+        await next_quiz(q, uid, ctx)
+
+    elif d == "qz_score":
+        u2 = get_user(uid)
+        qs = u2.get("quiz_score", 0)
+        qt = u2.get("quiz_total", 0)
+        pct = round(qs / qt * 100) if qt else 0
+        await q.edit_message_text(
+            f"📊 *Ваш счёт*\n\n✅ {qs}/{qt} ({pct}%)\n\n"
+            f"{'🏆 Отлично!' if pct >= 80 else '💪 Продолжайте!'}",
             parse_mode="Markdown"
         )
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    user_id = update.effective_user.id
-    update_streak(user_id)
+    elif d.startswith("qz_"):
+        chosen = int(d[3:])
+        correct_idx = ctx.user_data.get("qz_correct")
+        correct_phrase = ctx.user_data.get("qz_phrase", {})
+        if correct_idx is None:
+            await q.edit_message_text("Начните тест заново через 🎯 Тест")
+            return
+        u2 = get_user(uid)
+        qs = u2.get("quiz_score", 0)
+        qt = u2.get("quiz_total", 0) + 1
+        if chosen == correct_idx:
+            qs += 1
+            result = "✅ *Правильно!*"
+        else:
+            result = "❌ *Неправильно!*"
+        upd(uid, {"quiz_score": qs, "quiz_total": qt})
+        ctx.user_data.pop("qz_correct", None)
+        ctx.user_data.pop("qz_phrase", None)
 
-    if text == "📚 Уроки":
-        await lessons_menu(update, context)
-    elif text == "🎯 Тест глаголы":
-        await update.message.reply_text("🔄 Загрузка теста...")
-        context.user_data["quiz_type"] = "verbs"
-        await send_quiz_question_to_message(update.message, user_id, context, "verbs")
-    elif text == "🎯 Тест слова":
-        await update.message.reply_text("🔄 Загрузка теста...")
-        context.user_data["quiz_type"] = "words"
-        await send_quiz_question_to_message(update.message, user_id, context, "words")
-    elif text == "🔢 Тест числа":
-        await update.message.reply_text("🔄 Загрузка теста...")
-        context.user_data["quiz_type"] = "numbers"
-        await send_quiz_question_to_message(update.message, user_id, context, "numbers")
-    elif text == "🎯 Тест":
-        await quiz(update, context)
-    elif text == "📊 Мой прогресс":
-        await progress(update, context)
-    elif text == "💡 Совет дня":
-        await daily_tip(update, context)
-    elif text == "⚙️ Настройки":
-        await settings(update, context)
-    else:
-        await update.message.reply_text(
-            "Выберите раздел в меню ниже 👇",
-            reply_markup=get_menu_keyboard(user_id)
-        )
-
-async def send_quiz_question_to_message(message, user_id: int, context, quiz_type: str = "words"):
-    user_data = get_user(user_id)
-    version = user_data.get("version", 1)
-    level = user_data.get("level", 1)
-
-    pool = get_quiz_pool(version, level, quiz_type)
-    
-    if quiz_type == "verbs":
-        title = "🔥 Тест: глаголы"
-    elif quiz_type == "numbers":
-        title = "🔢 Тест: числа"
-    else:
-        title = "📖 Тест: слова"
-
-    if len(pool) < 4:
-        await message.reply_text("Недостаточно фраз для теста.")
-        return
-
-    correct = random.choice(pool)
-    wrong_options = random.sample([p for p in pool if p["he"] != correct["he"]], min(3, len(pool)-1))
-    all_options = [correct] + wrong_options
-    random.shuffle(all_options)
-    correct_pos = next(i for i, p in enumerate(all_options) if p["he"] == correct["he"])
-
-    context.user_data["quiz_correct"] = correct_pos
-    context.user_data["quiz_phrase"] = correct
-    context.user_data["quiz_type"] = quiz_type
-    context.user_data["quiz_pool"] = pool
-
-    text = f"{title} (Уровень {level})\n\nКак переводится:\n\n🇮🇱 _{correct['he']}_\n🔤 ({correct['translit']})\n\n"
-    
-    if version == 2 and "example" in correct and correct["example"]:
-        text += f"📝 *Пример:* {correct['example']}\n\n"
-    
-    text += "Выберите правильный перевод:"
-
-    buttons = [[InlineKeyboardButton(opt["ru"], callback_data=f"quiz_{i}")] for i, opt in enumerate(all_options)]
-
-    await message.reply_text(
-        text,
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
-
-async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_data = get_user(update.effective_user.id)
-    reminders = user_data.get("reminders", True)
-    status = "включены ✅" if reminders else "выключены ❌"
-    buttons = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "🔔 Выключить напоминания" if reminders else "🔔 Включить напоминания",
-                callback_data="toggle_reminders"
+        if chosen == correct_idx:
+            # Правильно — сразу следующий вопрос
+            await q.answer("✅ Правильно!", show_alert=False)
+            await next_quiz(q, uid, ctx)
+        else:
+            # Неправильно — показываем правильный ответ
+            text = (
+                f"❌ *Неправильно!*\n\n"
+                f"🇮🇱 `{correct_phrase.get('he','')}`\n"
+                f"👄 _{correct_phrase.get('tr','')}_\n"
+                f"🇷🇺 {correct_phrase.get('ru','')}"
             )
-        ],
-        [InlineKeyboardButton("🗑 Сбросить прогресс", callback_data="reset_progress")],
-    ])
-    await update.message.reply_text(
-        f"⚙️ *Настройки*\n\n🔔 Ежедневные напоминания: {status}\n\n"
-        f"Бот присылает напоминание каждый день в 9:00 🕘",
-        parse_mode="Markdown",
-        reply_markup=buttons
-    )
+            if u2["variant"] == 2 and "past" in correct_phrase:
+                text += f"\n\n🕰 {correct_phrase['past']}\n🔮 {correct_phrase['future']}"
+            await q.edit_message_text(
+                text,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("➡️ Следующий вопрос", callback_data="qz_next")],
+                    [InlineKeyboardButton("📊 Мой счёт", callback_data="qz_score")],
+                ])
+            )
 
-async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
+    # Настройки
+    elif d == "toggle_rem":
+        u2 = get_user(uid)
+        new_v = not u2.get("reminders", True)
+        upd(uid, {"reminders": new_v})
+        await q.edit_message_text(f"🔔 Напоминания {'включены ✅' if new_v else 'выключены ❌'}")
 
-    if query.data == "toggle_reminders":
-        user_data = get_user(user_id)
-        new_val = not user_data.get("reminders", True)
-        update_user(user_id, {"reminders": new_val})
-        status = "включены ✅" if new_val else "выключены ❌"
-        await query.edit_message_text(f"🔔 Напоминания теперь {status}")
+    elif d == "reset_prog":
+        upd(uid, {"learned": [], "streak": 0, "quiz_score": 0, "quiz_total": 0})
+        await q.edit_message_text("🗑 Прогресс сброшен!")
 
-    elif query.data == "reset_progress":
-        update_user(user_id, {
-            "learned": [], "streak": 0, "total_phrases": 0,
-            "quiz_score": 0, "quiz_total": 0
-        })
-        await query.edit_message_text("🗑 Прогресс сброшен. Начинаем сначала!")
-
-# ─── Daily Reminder ───────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ЕЖЕДНЕВНЫЕ НАПОМИНАНИЯ
+# ═══════════════════════════════════════════════════════════════════════════════
 def _reminder_loop(bot_token: str):
-    import time as _time
+    import time as _t
     while True:
         now = datetime.now()
-        next_run = now.replace(hour=9, minute=0, second=0, microsecond=0)
-        if next_run <= now:
-            next_run += timedelta(days=1)
-        sleep_sec = (next_run - now).total_seconds()
-        logger.info(f"Следующее напоминание через {sleep_sec/3600:.1f} ч")
-        _time.sleep(sleep_sec)
-
+        nxt = now.replace(hour=9, minute=0, second=0, microsecond=0)
+        if nxt <= now:
+            nxt += timedelta(days=1)
+        _t.sleep((nxt - now).total_seconds())
         data = load_data()
         tip = random.choice(DAILY_TIPS)
-        for uid, user_data in data.items():
-            if not user_data.get("reminders", True):
+        for uid_s, u in data.items():
+            if not u.get("reminders", True):
                 continue
-            text = (
-                f"🌅 *Доброе утро! Время учить иврит!*\n\n"
+            txt = (
+                f"🌅 Доброе утро! Время учить иврит!\n\n"
                 f"{tip}\n\n"
-                f"Ваша серия: 🔥 {user_data.get('streak', 0)} дней\n"
-                f"Уровень: {user_data.get('level', 1)}\n\n"
-                f"Выберите урок и выучите 3-5 новых фраз! 💪"
-            )
-            payload = json.dumps({
-                "chat_id": int(uid),
-                "text": text,
-                "parse_mode": "Markdown",
-            }).encode("utf-8")
-            req = urllib.request.Request(
-                f"https://api.telegram.org/bot{bot_token}/sendMessage",
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST",
+                f"Серия: 🔥 {u.get('streak', 0)} дней"
             )
             try:
+                payload = json.dumps({"chat_id": int(uid_s), "text": txt}).encode()
+                req = urllib.request.Request(
+                    f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
                 urllib.request.urlopen(req, timeout=10)
             except Exception as e:
-                logger.warning(f"Напоминание для {uid} не отправлено: {e}")
+                logger.warning(f"Reminder {uid_s}: {e}")
 
-# ─── Main ──────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════════════════════════════
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("quiz", quiz))
-    app.add_handler(CommandHandler("progress", progress))
-
-    app.add_handler(CallbackQueryHandler(next_quiz_callback, pattern=r"^(next_quiz_|show_score)"))
-    app.add_handler(CallbackQueryHandler(settings_callback, pattern=r"^(toggle_reminders|reset_progress)$"))
-    app.add_handler(CallbackQueryHandler(callback_handler))
-
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    t = threading.Thread(target=_reminder_loop, args=(TELEGRAM_TOKEN,), daemon=True)
-    t.start()
-
-    logger.info("Bot started!")
+    threading.Thread(target=_reminder_loop, args=(TELEGRAM_TOKEN,), daemon=True).start()
+    logger.info("🚀 Bot started!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
